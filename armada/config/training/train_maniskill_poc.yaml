@@ -1,0 +1,31 @@
+defaults:
+  - _self_
+  - task: maniskill_pick
+  - policy: diffusion_transformer_hybrid_dinov2
+  - /optimizer: adam
+
+device_ids: [0]
+
+training:
+  num_epochs: 50
+  num_steps_per_epoch: null
+  validation_every: 10
+  checkpoint_every: 5
+  log_every: 50
+  lr_scheduler: cosine
+  use_ema: True
+  gradient_accumulate_every: 1
+
+dataloader:
+  batch_size: 32
+  num_workers: 2
+  pin_memory: True
+
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+
+logging:
+  log_dir: ${hydra:runtime.output_dir}
+  project_name: maniskill_armada
+  run_name: poc_training
