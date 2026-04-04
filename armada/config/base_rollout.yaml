@@ -4,6 +4,20 @@ defaults:
 
 _target_: env_runner.real_env_runner.RealEnvRunner
 fps: 10
+env_backend: hardware
+
+maniskill:
+  env_id: PickCube-v1
+  num_envs: 1
+  obs_mode: rgbd
+  control_mode: pd_ee_delta_pose
+  render_mode: rgb_array
+  seed: ${seed}
+  side_camera_name: base_camera
+  wrist_camera_name: base_camera
+  max_snapshot_steps: 5000
+  auto_intervention_steps: ${Ta}
+  gripper_max_width: 0.09
 
 device_ids: '0'
 checkpoint_path: /path/to/checkpoint

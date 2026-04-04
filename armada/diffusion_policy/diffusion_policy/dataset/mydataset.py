@@ -27,7 +27,7 @@ class MyDataset(BaseImageDataset):
             seed=42,
             val_ratio=0.0,
             max_train_episodes=None,
-            n_obs_steps=1,
+            n_obs_steps=2,
             shape_meta=None,
             random_crop=False,
             color_jitter=False,
@@ -75,9 +75,9 @@ class MyDataset(BaseImageDataset):
         wrist_img_processor = []
 
         if random_crop:
-            side_img_processor.append(transforms.Resize((image_shape[1]+8, image_shape[2]+8), interpolation=transforms.InterpolationMode.BICUBIC))
+            side_img_processor.append(transforms.Resize((image_shape[1]+8, image_shape[2]+8), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True))
             side_img_processor.append(transforms.RandomCrop((image_shape[1], image_shape[2])))
-            wrist_img_processor.append(transforms.Resize((image_shape[1]+8, image_shape[2]+8), interpolation=transforms.InterpolationMode.BICUBIC))
+            wrist_img_processor.append(transforms.Resize((image_shape[1]+8, image_shape[2]+8), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True))
             wrist_img_processor.append(transforms.RandomCrop((image_shape[1], image_shape[2])))
         
         # GPU-based color augmentation using Kornia
@@ -121,7 +121,7 @@ class MyDataset(BaseImageDataset):
 
         if 'ee_pose' in self.shape_meta['obs']:
             tcp_pose_sample = self.replay_buffer['tcp_pose']
-            ee_pose = np.zeros((tcp_pose_sample.shape[0], self.ee_pose_dim))
+            ee_pose = np.zeros((tcp_pose_sample.shape[0], self.ee_pose_dim), dtype=np.float32)
             ee_pose[:, :3] = tcp_pose_sample[:, :3]
             ee_rot = tcp_pose_sample[:, 3:7]
             if self.obs_rot_transformer is not None:
@@ -144,8 +144,8 @@ class MyDataset(BaseImageDataset):
 
     def _sample_to_data(self, sample):
         qpos = sample['joint_pos'][:,:7].astype(np.float32)
-        wrist_img = np.moveaxis(sample['wrist_cam'],-1,1)/255
-        side_img = np.moveaxis(sample['side_cam'],-1,1)/255
+        wrist_img = np.moveaxis(sample['wrist_cam'], -1, 1).astype(np.float32) / 255.0
+        side_img = np.moveaxis(sample['side_cam'], -1, 1).astype(np.float32) / 255.0
 
         action_sample = sample['action'].copy()
         action_processed = np.zeros((action_sample.shape[0], self.action_dim))
@@ -159,7 +159,7 @@ class MyDataset(BaseImageDataset):
 
         if 'ee_pose' in self.shape_meta['obs']:
             tcp_pose_sample = sample['tcp_pose'].copy()
-            ee_pose = np.zeros((tcp_pose_sample.shape[0], self.ee_pose_dim))
+            ee_pose = np.zeros((tcp_pose_sample.shape[0], self.ee_pose_dim), dtype=np.float32)
             ee_pose[:, :3] = tcp_pose_sample[:, :3]
             rel_ee_rot = tcp_pose_sample[:, 3:7]
             if self.obs_rot_transformer is not None:

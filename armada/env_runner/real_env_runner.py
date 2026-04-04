@@ -15,8 +15,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from armada.diffusion_policy.diffusion_policy.common.replay_buffer import ReplayBuffer
 from armada.diffusion_policy.diffusion_policy.common.pytorch_util import dict_apply
 from armada.diffusion_policy.diffusion_policy.model.common.rotation_transformer import RotationTransformer
-
-from hardware.robot_env import RobotEnv
 from hardware.my_device.macros import CAM_SERIAL, HUMAN, ROBOT
 from armada.utils.episode_manager import EpisodeManager
 from armada.env_runner.base_env_runner import BaseEnvRunner
@@ -36,6 +34,7 @@ class RealEnvRunner(BaseEnvRunner):
         self._initialize_robot_env()
         self._initialize_episode_manager()
         self._initialize_replay_buffer()
+        self.is_sim = getattr(self.cfg, 'env_backend', 'hardware') == 'maniskill'
 
         self.max_episode_length = self._calculate_max_episode_length()
         
@@ -109,11 +108,24 @@ class RealEnvRunner(BaseEnvRunner):
     
     def _initialize_robot_env(self):
         """Initialize robot environment"""
-        self.robot_env = RobotEnv(
-            camera_serial=CAM_SERIAL, 
-            img_shape=self.img_shape, 
-            fps=self.fps
-        )
+        env_backend = getattr(self.cfg, 'env_backend', 'hardware')
+        if env_backend == 'maniskill':
+            from hardware.maniskill_robot_env import ManiSkillRobotEnv
+
+            self.robot_env = ManiSkillRobotEnv(
+                camera_serial=CAM_SERIAL,
+                img_shape=self.img_shape,
+                fps=self.fps,
+                maniskill_cfg=getattr(self.cfg, 'maniskill', None)
+            )
+        else:
+            from hardware.robot_env import RobotEnv
+
+            self.robot_env = RobotEnv(
+                camera_serial=CAM_SERIAL,
+                img_shape=self.img_shape,
+                fps=self.fps
+            )
     
     def _initialize_episode_manager(self):
         """Initialize episode manager"""
@@ -408,19 +420,27 @@ class RealEnvRunner(BaseEnvRunner):
                         print(f"Failure detected! Due to {failure_reason}")
                     else:
                         print("Maximum episode length reached!")
-                    
-                    print("Press 'c' to continue; Press 'd' to discard the demo; Press 'h' to request human intervention; Press 'f' to finish the episode.")
-                    while not self.robot_env.keyboard.ctn and not self.robot_env.keyboard.discard and not self.robot_env.keyboard.help and not self.robot_env.keyboard.finish:
-                        time.sleep(0.1)
-                    
-                    if self.robot_env.keyboard.ctn and self.j < self.max_episode_length:
-                        print("False Positive failure! Continue policy rollout.")
-                        self.robot_env.keyboard.ctn = False
-                    elif self.robot_env.keyboard.ctn and self.j >= self.max_episode_length:
-                        print("Cannot continue policy rollout, maximum episode length reached. Calling for human intervention.")
-                        self.robot_env.keyboard.ctn = False
+
+                    if self.is_sim:
+                        # In simulation we avoid blocking for hardware keyboard input.
+                        if self.j < self.max_episode_length and failure_flag:
+                            self.robot_env.keyboard.help = True
+                            break
                         self.robot_env.keyboard.help = True
                         break
+                    else:
+                        print("Press 'c' to continue; Press 'd' to discard the demo; Press 'h' to request human intervention; Press 'f' to finish the episode.")
+                        while not self.robot_env.keyboard.ctn and not self.robot_env.keyboard.discard and not self.robot_env.keyboard.help and not self.robot_env.keyboard.finish:
+                            time.sleep(0.1)
+
+                        if self.robot_env.keyboard.ctn and self.j < self.max_episode_length:
+                            print("False Positive failure! Continue policy rollout.")
+                            self.robot_env.keyboard.ctn = False
+                        elif self.robot_env.keyboard.ctn and self.j >= self.max_episode_length:
+                            print("Cannot continue policy rollout, maximum episode length reached. Calling for human intervention.")
+                            self.robot_env.keyboard.ctn = False
+                            self.robot_env.keyboard.help = True
+                            break
             # ================Detect failure end===============
             
             # Check for maximum episode length without failure detection

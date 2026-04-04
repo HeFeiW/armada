@@ -30,7 +30,7 @@ def main(rank, cfg: OmegaConf, device_ids):
     torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
-    with hydra.initialize(config_path='./config/training'):
+    with hydra.initialize(config_path='./config/training', version_base=None):
         cfg = hydra.compose(config_name=sys.argv[1])
 
     device_ids = [int(x) for x in cfg.device_ids.split(",")]

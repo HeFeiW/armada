@@ -12,5 +12,8 @@ baseline_data/
 baseline_data
 third_party/multi_gpu_dp
 outputs/
+armada_data/
+.vscode/
+outputs_rollout/
 
 ot_reweight.sh
