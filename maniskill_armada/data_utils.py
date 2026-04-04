@@ -24,42 +24,29 @@ def maniskill_obs_to_armada_format(obs: Dict, env: Any) -> Dict:
     Returns:
         dict with keys: tcp_pose, joint_pos, gripper_state
     """
-    # Extract agent state (task-dependent)
+    extra_obs = obs.get('extra', {})
     agent_obs = obs.get('agent', {})
 
-    # TCP pose: position + quaternion (scalar_last format)
-    tcp_pos = agent_obs.get('tcp_position', None)  # [3]
+    tcp_pose = extra_obs.get('tcp_pose', None)
+    if tcp_pose is None:
+        tcp_pose = getattr(getattr(env.unwrapped.agent, 'tcp', None), 'pose', None)
+        if tcp_pose is not None:
+            tcp_pose = np.concatenate([
+                np.asarray(tcp_pose.p)[0],
+                np.asarray(tcp_pose.q)[0],
+            ])
+    if tcp_pose is None:
+        raise ValueError('Cannot extract tcp_pose from ManiSkill observation')
+    tcp_pose = np.asarray(tcp_pose, dtype=np.float32).reshape(-1)
 
-    if tcp_pos is None:
-        raise ValueError("Cannot extract TCP position from obs")
-
-    # Get TCP rotation
-    tcp_rot_matrix = agent_obs.get('tcp_rotation', None)
-
-    if tcp_rot_matrix is None:
-        # Try from base frame + arm angles
-        tcp_rot_matrix = np.eye(3)
-
-    # Convert rotation matrix to quaternion (scalar_last: qx, qy, qz, qw)
-    if tcp_rot_matrix.shape == (3, 3):
-        rot = R.from_matrix(tcp_rot_matrix)
-        tcp_quat = rot.as_quat()  # [qx, qy, qz, qw] scalar_last
-    else:
-        tcp_quat = tcp_rot_matrix  # Assume already quaternion
-
-    # Full TCP pose: [x, y, z, qx, qy, qz, qw]
-    tcp_pose = np.concatenate([tcp_pos, tcp_quat]).astype(np.float32)
-
-    # Joint positions (first 7 DOF for arm)
     qpos = agent_obs.get('qpos', None)
     if qpos is not None:
-        joint_pos = qpos[:7].astype(np.float32)
+        joint_pos = np.asarray(qpos, dtype=np.float32).reshape(-1)[:7]
     else:
-        joint_pos = np.zeros(7, dtype=np.float32)
+        joint_pos = np.asarray(env.unwrapped.agent.robot.get_qpos(), dtype=np.float32).reshape(-1)[:7]
 
-    # Gripper state (0=open, 1=closed)
-    gripper_state = agent_obs.get('gripper_qpos', np.array([0.0, 0.0]))
-    gripper_value = np.mean(gripper_state).astype(np.float32)
+    gripper_state = extra_obs.get('is_grasped', np.array([0.0]))
+    gripper_value = np.asarray(gripper_state, dtype=np.float32).reshape(-1)[0]
 
     return {
         'tcp_pose': tcp_pose,           # (7,) float32
@@ -68,7 +55,7 @@ def maniskill_obs_to_armada_format(obs: Dict, env: Any) -> Dict:
     }
 
 
-def render_cameras(env: Any, camera_names: Optional[list] = None,
+def render_cameras(obs_or_env: Any, env: Any = None, camera_names: Optional[list] = None,
                    resolution: Tuple[int, int] = (640, 480)) -> Tuple[np.ndarray, np.ndarray]:
     """
     Render RGB images from multiple camera viewpoints.
@@ -82,28 +69,55 @@ def render_cameras(env: Any, camera_names: Optional[list] = None,
         (side_img, wrist_img): Both (height, width, 3) uint8 RGB
     """
     if camera_names is None:
-        camera_names = ['viewer', 'wrist_camera']
+        camera_names = ['base_camera', 'base_camera']
 
-    # Try rendering with env's render method
+    obs = obs_or_env if isinstance(obs_or_env, dict) else None
+    if env is None and obs is None:
+        env = obs_or_env
+
+    # Try extracting sensor data directly from ManiSkill observations first.
     try:
-        # ManiSkill typically uses render(mode='rgb_array', camera_name=...)
-        side_img = env.render(mode='rgb_array', camera_name=camera_names[0],
-                              resolution=resolution)
+        side_img = None
+        wrist_img = None
 
-        # For wrist, try wrist camera; fallback to second viewer
-        try:
-            wrist_img = env.render(mode='rgb_array', camera_name=camera_names[1],
-                                   resolution=resolution)
-        except:
-            # Fallback to multiple viewers
-            wrist_img = env.render(mode='rgb_array', camera_name='third_person_camera',
-                                   resolution=resolution)
+        if obs is not None:
+            sensor_data = obs.get('sensor_data', {})
+            if camera_names[1] in sensor_data and 'rgb' in sensor_data[camera_names[1]]:
+                wrist_tensor = sensor_data[camera_names[1]]['rgb']
+                if hasattr(wrist_tensor, 'detach'):
+                    wrist_img = wrist_tensor.detach().cpu().numpy()[0]
+                else:
+                    wrist_img = np.asarray(wrist_tensor)[0]
+            if camera_names[0] in sensor_data and 'rgb' in sensor_data[camera_names[0]]:
+                side_tensor = sensor_data[camera_names[0]]['rgb']
+                if hasattr(side_tensor, 'detach'):
+                    side_img = side_tensor.detach().cpu().numpy()[0]
+                else:
+                    side_img = np.asarray(side_tensor)[0]
+
+        if env is not None:
+            try:
+                rendered = env.render()
+                if hasattr(rendered, 'detach'):
+                    rendered = rendered.detach().cpu().numpy()
+                else:
+                    rendered = np.asarray(rendered)
+                if rendered.ndim == 4:
+                    rendered = rendered[0]
+                if side_img is None:
+                    side_img = rendered
+            except Exception:
+                pass
+
+        if side_img is None:
+            side_img = np.random.randint(0, 256, (*resolution[::-1], 3), dtype=np.uint8)
+        if wrist_img is None:
+            wrist_img = side_img.copy()
 
     except Exception as e:
         print(f"Warning: Camera rendering failed ({e}), using random images")
-        # Fallback: dummy images
         side_img = np.random.randint(0, 256, (*resolution[::-1], 3), dtype=np.uint8)
-        wrist_img = np.random.randint(0, 256, (*resolution[::-1], 3), dtype=np.uint8)
+        wrist_img = side_img.copy()
 
     # Ensure correct shape and type
     side_img = np.asarray(side_img, dtype=np.uint8)
