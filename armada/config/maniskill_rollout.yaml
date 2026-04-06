@@ -1,14 +1,28 @@
 defaults:
-  - training: train_diffusion_transformer_real_hybrid_dino_multi_gpu_workspace
+  - training: train_maniskill_poc
   - _self_
 
 _target_: env_runner.real_env_runner.RealEnvRunner
 fps: 10
-env_backend: hardware
+env_backend: maniskill
+
+# Execution devices
+device_ids: '0'
+
+# Model / data paths
+checkpoint_path: /home/tmp_wanghf/armada/outputs/2026.04.04/20.14.11_train_diffusion_transformer_hybrid_dino_multi_gpu_maniskill_pick/checkpoints/latest.ckpt
+train_dataset_path: /home/tmp_wanghf/armada/armada_data/maniskill_pick
+save_buffer_path: /home/tmp_wanghf/armada/armada_data/maniskill_pick_rollout_poc
+output_dir: /home/tmp_wanghf/armada/outputs_rollout/maniskill_poc
+
+# Rollout setup
+Ta: 8
+random_init: True
+seed: 31
 
 maniskill:
   env_id: PickCube-v1
-  num_envs: 1
+  num_envs: 2
   obs_mode: rgbd
   control_mode: pd_ee_delta_pose
   render_mode: rgb_array
@@ -19,26 +33,19 @@ maniskill:
   auto_intervention_steps: ${Ta}
   gripper_max_width: 0.09
 
+# Human-in-loop for simulation
 human_loop:
-  # mode: auto | manual
-  mode: auto
+  # auto | manual
+  mode: manual
+  visualize: true
+  window_name: ARMADA ManiSkill Rollout
   on_failure: teleop
   on_timeout: teleop
   prompt_timeout_s: 20
   max_teleop_steps: 64
   max_blocked_rounds: 16
 
-device_ids: '0'
-checkpoint_path: /path/to/checkpoint
-train_dataset_path: /path/to/trained/dataset
-save_buffer_path: /path/to/save/rollout/data
-output_dir: /path/to/output/visualization
-
-Ta: 8
-random_init: True
-seed: 31
-
-# Failure detection configuration
+# Failure detection
 failure_detection:
   _target_: float.float.FLOAT
   max_queue_size: 3
@@ -60,6 +67,6 @@ policy:
   num_inference_steps: 8
   obs_encoder:
     pretrained_path: null
-  
+
 training:
   output_dir: ${output_dir}

@@ -62,6 +62,7 @@ class ManiSkillRobotEnv:
             control_mode=self.control_mode,
             render_mode=self.render_mode,
         )
+        self.single_action_space = getattr(self.env, "single_action_space", self.env.action_space)
 
         self.keyboard = SimpleNamespace(
             quit=False,
@@ -80,18 +81,18 @@ class ManiSkillRobotEnv:
         bicubic = InterpolationMode.BICUBIC
         self.policy_side_image_processor = Compose(
             [
-                Resize((img_shape[1] + 8, img_shape[2] + 8), interpolation=bicubic),
+                Resize((img_shape[1] + 8, img_shape[2] + 8), interpolation=bicubic, antialias=True),
                 CenterCrop((img_shape[1], img_shape[2])),
             ]
         )
         self.policy_wrist_image_processor = Compose(
             [
-                Resize((img_shape[1] + 8, img_shape[2] + 8), interpolation=bicubic),
+                Resize((img_shape[1] + 8, img_shape[2] + 8), interpolation=bicubic, antialias=True),
                 CenterCrop((img_shape[1], img_shape[2])),
             ]
         )
         self.demo_image_processor = Compose(
-            [Resize((img_shape[1] + 8, img_shape[2] + 8), interpolation=bicubic)]
+            [Resize((img_shape[1] + 8, img_shape[2] + 8), interpolation=bicubic, antialias=True)]
         )
 
         self.last_obs = None
@@ -103,6 +104,9 @@ class ManiSkillRobotEnv:
         self.last_gripper_width = self.gripper_max_width
         self._teleop_steps = 0
         self._snapshots = []
+        self.active_env_idx = 0
+        self.last_terminated = np.zeros((self.num_envs,), dtype=np.bool_)
+        self.last_truncated = np.zeros((self.num_envs,), dtype=np.bool_)
 
     def _to_numpy(self, value):
         if isinstance(value, torch.Tensor):
@@ -120,6 +124,19 @@ class ManiSkillRobotEnv:
             return v
 
         return _clone(state_dict)
+
+    def _index_env(self, value, env_idx: int):
+        if isinstance(value, dict):
+            return {k: self._index_env(v, env_idx) for k, v in value.items()}
+        if isinstance(value, torch.Tensor):
+            if value.ndim == 0:
+                return value
+            return value[env_idx]
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                return value
+            return value[env_idx]
+        return value
 
     def _capture_snapshot(self):
         if not hasattr(self.env.unwrapped, "get_state_dict"):
@@ -139,38 +156,44 @@ class ManiSkillRobotEnv:
         self.last_done = False
         return True
 
-    def _extract_tcp_pose(self, obs: Dict[str, Any]) -> np.ndarray:
+    def _extract_tcp_pose(self, obs: Dict[str, Any], env_idx: Optional[int] = None) -> np.ndarray:
+        if env_idx is None:
+            env_idx = self.active_env_idx
         if obs is not None and isinstance(obs, dict):
             extra = obs.get("extra", {})
             tcp_pose = extra.get("tcp_pose", None)
             if tcp_pose is not None:
-                tcp = self._to_numpy(tcp_pose)[0]
+                tcp = self._to_numpy(tcp_pose)[env_idx]
                 return tcp.astype(np.float32)
 
-        p = self._to_numpy(self.env.unwrapped.agent.tcp.pose.p)[0]
-        q = self._to_numpy(self.env.unwrapped.agent.tcp.pose.q)[0]
+        p = self._to_numpy(self.env.unwrapped.agent.tcp.pose.p)[env_idx]
+        q = self._to_numpy(self.env.unwrapped.agent.tcp.pose.q)[env_idx]
         return np.concatenate([p, q], axis=0).astype(np.float32)
 
-    def _extract_joint_pos(self, obs: Dict[str, Any]) -> np.ndarray:
+    def _extract_joint_pos(self, obs: Dict[str, Any], env_idx: Optional[int] = None) -> np.ndarray:
+        if env_idx is None:
+            env_idx = self.active_env_idx
         if obs is not None and isinstance(obs, dict):
             agent = obs.get("agent", {})
             qpos = agent.get("qpos", None)
             if qpos is not None:
-                return self._to_numpy(qpos)[0][:7].astype(np.float32)
-        return self._to_numpy(self.env.unwrapped.agent.robot.get_qpos())[0][:7].astype(
+                return self._to_numpy(qpos)[env_idx][:7].astype(np.float32)
+        return self._to_numpy(self.env.unwrapped.agent.robot.get_qpos())[env_idx][:7].astype(
             np.float32
         )
 
-    def _render_image(self, camera_name: str) -> np.ndarray:
+    def _render_image(self, camera_name: str, env_idx: Optional[int] = None) -> np.ndarray:
+        if env_idx is None:
+            env_idx = self.active_env_idx
         img = None
         if self.last_obs is not None and isinstance(self.last_obs, dict):
             sensor_data = self.last_obs.get("sensor_data", {})
             if camera_name in sensor_data and "rgb" in sensor_data[camera_name]:
                 rgb_tensor = sensor_data[camera_name]["rgb"]
                 if isinstance(rgb_tensor, torch.Tensor):
-                    rgb = rgb_tensor.detach().cpu().numpy()[0]
+                    rgb = rgb_tensor.detach().cpu().numpy()[env_idx]
                 else:
-                    rgb = np.asarray(rgb_tensor)[0]
+                    rgb = np.asarray(rgb_tensor)[env_idx]
                 img = rgb
 
         if img is None:
@@ -178,7 +201,7 @@ class ManiSkillRobotEnv:
             if isinstance(rendered, torch.Tensor):
                 rendered = rendered.detach().cpu().numpy()
             if rendered.ndim == 4:
-                rendered = rendered[0]
+                rendered = rendered[env_idx]
             img = rendered
 
         self.last_render = np.asarray(img, dtype=np.uint8)
@@ -191,11 +214,13 @@ class ManiSkillRobotEnv:
         self.keyboard.infer = False
 
         self.last_obs, self.last_info = self.env.reset(seed=self.seed)
-        tcp_pose = self._extract_tcp_pose(self.last_obs)
+        tcp_pose = self._extract_tcp_pose(self.last_obs, self.active_env_idx)
         self.last_tcp_pose = tcp_pose
         self.robot.init_pose = tcp_pose.copy()
-        self.last_joint_pos = self._extract_joint_pos(self.last_obs)
+        self.last_joint_pos = self._extract_joint_pos(self.last_obs, self.active_env_idx)
         self.last_gripper_width = self.gripper_max_width
+        self.last_terminated[:] = False
+        self.last_truncated[:] = False
 
         self._snapshots = []
         self._capture_snapshot()
@@ -206,14 +231,17 @@ class ManiSkillRobotEnv:
 
         return self.get_robot_state()
 
-    def get_robot_state(self):
-        tcp_pose = self._extract_tcp_pose(self.last_obs)
-        joint_pos = self._extract_joint_pos(self.last_obs)
+    def get_robot_state(self, env_idx: Optional[int] = None):
+        if env_idx is None:
+            env_idx = self.active_env_idx
+
+        tcp_pose = self._extract_tcp_pose(self.last_obs, env_idx)
+        joint_pos = self._extract_joint_pos(self.last_obs, env_idx)
         self.last_tcp_pose = tcp_pose
         self.last_joint_pos = joint_pos
 
-        side_rgb = self._render_image(self.side_camera_name)
-        wrist_rgb = self._render_image(self.wrist_camera_name)
+        side_rgb = self._render_image(self.side_camera_name, env_idx)
+        wrist_rgb = self._render_image(self.wrist_camera_name, env_idx)
 
         policy_side_img = self.policy_side_image_processor(
             torch.from_numpy(side_rgb.copy()).permute(2, 0, 1)
@@ -239,8 +267,14 @@ class ManiSkillRobotEnv:
             "wrist_img_raw": wrist_rgb.copy(),
         }
 
-    def _abs_target_to_delta_action(self, tcp_action: np.ndarray, gripper_action: float):
-        curr_pose = self.last_tcp_pose if self.last_tcp_pose is not None else tcp_action.copy()
+    def _abs_target_to_delta_action(
+        self,
+        tcp_action: np.ndarray,
+        gripper_action: float,
+        curr_pose: Optional[np.ndarray] = None,
+    ):
+        if curr_pose is None:
+            curr_pose = self.last_tcp_pose if self.last_tcp_pose is not None else tcp_action.copy()
 
         curr_p = curr_pose[:3]
         curr_q = curr_pose[3:]
@@ -258,15 +292,47 @@ class ManiSkillRobotEnv:
             g = float(np.clip(gripper_action, -1.0, 1.0))
 
         action = np.concatenate([dp.astype(np.float32), dr, np.array([g], dtype=np.float32)])
-        return np.clip(action, self.env.action_space.low, self.env.action_space.high)
+        return np.clip(action, self.single_action_space.low, self.single_action_space.high)
 
-    def deploy_action(self, tcp_action, gripper_action):
-        action = self._abs_target_to_delta_action(np.asarray(tcp_action), float(gripper_action))
-        obs, _reward, terminated, truncated, info = self.env.step(action[None, :])
+    def deploy_action(self, tcp_action, gripper_action, env_idx: Optional[int] = None):
+        if env_idx is None:
+            env_idx = self.active_env_idx
+
+        curr_pose = None
+        if self.last_obs is not None:
+            curr_pose = self._extract_tcp_pose(self.last_obs, env_idx)
+        action = self._abs_target_to_delta_action(np.asarray(tcp_action), float(gripper_action), curr_pose=curr_pose)
+        batched_action = np.zeros((self.num_envs, action.shape[0]), dtype=np.float32)
+        batched_action[env_idx] = action
+        obs, _reward, terminated, truncated, info = self.env.step(batched_action)
         self.last_obs = obs
         self.last_info = info
-        self.last_done = bool(self._to_numpy(terminated)[0] or self._to_numpy(truncated)[0])
+        self.last_terminated = self._to_numpy(terminated).astype(np.bool_)
+        self.last_truncated = self._to_numpy(truncated).astype(np.bool_)
+        self.last_done = bool(self.last_terminated[env_idx] or self.last_truncated[env_idx])
         self.last_gripper_width = float(gripper_action)
+        self._capture_snapshot()
+
+    def deploy_action_batch(self, tcp_actions: Dict[int, np.ndarray], gripper_actions: Dict[int, float]):
+        action_dim = self.env.action_space.shape[-1]
+        batched_action = np.zeros((self.num_envs, action_dim), dtype=np.float32)
+        for env_idx, tcp_action in tcp_actions.items():
+            gripper_action = gripper_actions[env_idx]
+            curr_pose = None
+            if self.last_obs is not None:
+                curr_pose = self._extract_tcp_pose(self.last_obs, env_idx)
+            batched_action[env_idx] = self._abs_target_to_delta_action(
+                np.asarray(tcp_action),
+                float(gripper_action),
+                curr_pose=curr_pose,
+            )
+
+        obs, _reward, terminated, truncated, info = self.env.step(batched_action)
+        self.last_obs = obs
+        self.last_info = info
+        self.last_terminated = self._to_numpy(terminated).astype(np.bool_)
+        self.last_truncated = self._to_numpy(truncated).astype(np.bool_)
+        self.last_done = bool(np.any(self.last_terminated | self.last_truncated))
         self._capture_snapshot()
 
     def save_scene_images(self, output_dir, episode_idx):
@@ -294,6 +360,12 @@ class ManiSkillRobotEnv:
         detach_pos = np.array(curr_pose[:3], dtype=np.float32)
         detach_rot = R.from_quat(np.array(curr_pose[3:], dtype=np.float32), scalar_first=True)
         return detach_pos, detach_rot
+
+    def set_active_env(self, env_idx: int):
+        self.active_env_idx = int(np.clip(env_idx, 0, self.num_envs - 1))
+
+    def get_env_done_flags(self):
+        return self.last_terminated.copy(), self.last_truncated.copy()
 
     def human_teleop_step(self, last_p, last_r):
         # Sim teleop compatibility: execute tiny/no-op actions and hand control back automatically.
@@ -337,7 +409,7 @@ class ManiSkillRobotEnv:
         if not restored:
             return curr_pos, curr_rot
 
-        pose = self._extract_tcp_pose(self.last_obs)
+        pose = self._extract_tcp_pose(self.last_obs, self.active_env_idx)
         new_pos = pose[:3]
         new_rot = R.from_quat(pose[3:], scalar_first=True)
         return new_pos, new_rot

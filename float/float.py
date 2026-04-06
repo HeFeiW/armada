@@ -1,10 +1,13 @@
 import sys
 import os
+import json
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 import numpy as np
+import hashlib
+import os
 from typing import Dict, Any, Tuple, Optional, List
 from collections import OrderedDict
 import tqdm
@@ -86,6 +89,95 @@ class FLOAT(AsyncFailureDetectionModule):
         # Thresholds and success statistics
         self.expert_ot_threshold: Optional[float] = None
         self.success_ot_values: np.ndarray = np.zeros((0,))
+        self.human_latent_cache_version: int = 1
+
+    def _get_human_demo_latent_cache_path(self) -> str:
+        cache_dir = self.train_dataset_path or self.save_buffer_path or "."
+        return os.path.join(cache_dir, "human_demo_latent_cache.npz")
+
+    def _get_replay_buffer_signature(self) -> str:
+        episode_ends = np.asarray(self.replay_buffer.episode_ends, dtype=np.int64)
+        action_mode = np.asarray(self.replay_buffer.data.get('action_mode', np.array([], dtype=np.int8)))
+        payload = episode_ends.tobytes() + action_mode[: min(action_mode.shape[0], 4096)].tobytes()
+        return hashlib.sha1(payload).hexdigest()
+
+    def _get_policy_signature(self) -> str:
+        hasher = hashlib.sha1()
+        with torch.no_grad():
+            state_dict = self.policy.state_dict()
+            for name in sorted(state_dict.keys()):
+                tensor = state_dict[name].detach().cpu().contiguous()
+                hasher.update(name.encode("utf-8"))
+                hasher.update(str(tuple(tensor.shape)).encode("utf-8"))
+                hasher.update(str(tensor.dtype).encode("utf-8"))
+                hasher.update(tensor.numpy().tobytes())
+        return hasher.hexdigest()
+
+    def _build_human_demo_cache_signature(self) -> Dict[str, Any]:
+        return {
+            'version': self.human_latent_cache_version,
+            'policy_signature': self._get_policy_signature(),
+            'replay_buffer_signature': self._get_replay_buffer_signature(),
+            'obs_feature_dim': int(self.obs_feature_dim),
+            'max_episode_length': int(self.max_episode_length),
+            'Ta': int(self.Ta),
+            'To': int(self.To),
+            'ee_pose_dim': int(self.ee_pose_dim),
+            'img_shape': tuple(int(x) for x in self.img_shape),
+        }
+
+    def _signature_to_string(self, signature: Dict[str, Any]) -> str:
+        return json.dumps(signature, sort_keys=True)
+
+    def _load_human_demo_latent_cache(self) -> bool:
+        cache_path = self._get_human_demo_latent_cache_path()
+        if not os.path.isfile(cache_path):
+            print(f"[FLOAT] human demo latent cache not found: {cache_path}")
+            return False
+
+        try:
+            cache = np.load(cache_path, allow_pickle=True)
+            if int(cache['version']) != self.human_latent_cache_version:
+                print(f"[FLOAT] human demo latent cache version mismatch: {cache_path}")
+                return False
+
+            current_signature = self._build_human_demo_cache_signature()
+            cached_signature = str(cache['signature'].item())
+            if cached_signature != self._signature_to_string(current_signature):
+                print(f"[FLOAT] human demo latent cache signature mismatch: {cache_path}")
+                return False
+
+            self.human_demo_indices = cache['human_demo_indices'].tolist()
+            self.human_eps_len = cache['human_eps_len'].tolist()
+            all_human_latent = cache['all_human_latent']
+            if all_human_latent.dtype == np.object_:
+                # Backward compatibility for older cache files that stored a ragged object array.
+                loaded_latents = [torch.from_numpy(np.asarray(arr)).to(self.device) for arr in all_human_latent.tolist()]
+            else:
+                loaded_latents = [torch.from_numpy(np.asarray(arr)).to(self.device) for arr in all_human_latent]
+            self.all_human_latent = loaded_latents
+            print(f"[FLOAT] loaded human demo latent cache from {cache_path} (episodes={len(self.human_demo_indices)})")
+            return True
+        except Exception as e:
+            print(f"[FLOAT] failed to load human demo latent cache: {e}")
+            return False
+
+    def _save_human_demo_latent_cache(self) -> None:
+        cache_path = self._get_human_demo_latent_cache_path()
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            stacked_latents = np.stack([latent.detach().cpu().numpy() for latent in self.all_human_latent], axis=0)
+            payload = {
+                'version': np.array(self.human_latent_cache_version, dtype=np.int64),
+                'signature': np.array(self._signature_to_string(self._build_human_demo_cache_signature()), dtype=object),
+                'human_demo_indices': np.asarray(self.human_demo_indices, dtype=np.int64),
+                'human_eps_len': np.asarray(self.human_eps_len, dtype=np.int64),
+                'all_human_latent': stacked_latents.astype(np.float32),
+            }
+            np.savez_compressed(cache_path, **payload)
+            print(f"[FLOAT] saved human demo latent cache to {cache_path} (episodes={len(self.human_demo_indices)})")
+        except Exception as e:
+            print(f"[FLOAT] failed to save human demo latent cache: {e}")
 
     # ===================== Async handler =====================
     def handle_async_task(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -489,6 +581,13 @@ class FLOAT(AsyncFailureDetectionModule):
             if np.any(self.replay_buffer.data['action_mode'][episode_start: self.replay_buffer.episode_ends[i]] == HUMAN):
                 self.human_demo_indices.append(i)
 
+        print(f"[FLOAT] detected {len(self.human_demo_indices)} human demo episodes in replay buffer")
+
+        if self._load_human_demo_latent_cache():
+            return
+
+        print("[FLOAT] preparing human demo latents from scratch")
+
         self.all_human_latent = []
         self.human_eps_len = []
 
@@ -537,6 +636,10 @@ class FLOAT(AsyncFailureDetectionModule):
 
             self.human_eps_len.append(self.max_episode_length)
             self.all_human_latent.append(human_latent)
+
+        print(f"[FLOAT] encoded {len(self.all_human_latent)} human demo latent trajectories")
+
+        self._save_human_demo_latent_cache()
 
     def _load_success_statistics(self) -> None:
         import re

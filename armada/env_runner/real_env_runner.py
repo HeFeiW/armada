@@ -17,6 +17,8 @@ from armada.diffusion_policy.diffusion_policy.common.pytorch_util import dict_ap
 from armada.diffusion_policy.diffusion_policy.model.common.rotation_transformer import RotationTransformer
 from hardware.my_device.macros import CAM_SERIAL, HUMAN, ROBOT
 from armada.utils.episode_manager import EpisodeManager
+from armada.utils.maniskill_dashboard import ManiSkillRolloutDashboard
+from armada.utils.maniskill_hil import ManiSkillHumanInLoopController
 from armada.env_runner.base_env_runner import BaseEnvRunner
 
 class RealEnvRunner(BaseEnvRunner):
@@ -35,6 +37,24 @@ class RealEnvRunner(BaseEnvRunner):
         self._initialize_episode_manager()
         self._initialize_replay_buffer()
         self.is_sim = getattr(self.cfg, 'env_backend', 'hardware') == 'maniskill'
+        self.num_envs = int(getattr(getattr(self.cfg, 'maniskill', {}), 'num_envs', 1)) if self.is_sim else 1
+        self.is_parallel_sim = self.is_sim and self.num_envs > 1
+        self.sim_hil_controller = ManiSkillHumanInLoopController(
+            dict(getattr(self.cfg, 'human_loop', {})) if self.is_sim else {}
+        )
+        human_loop_cfg = getattr(self.cfg, 'human_loop', None)
+        self.sim_dashboard = None
+        if self.is_sim and human_loop_cfg is not None and bool(getattr(human_loop_cfg, 'visualize', True)):
+            self.sim_dashboard = ManiSkillRolloutDashboard(
+                enabled=True,
+                window_name=str(getattr(human_loop_cfg, 'window_name', 'ARMADA ManiSkill Rollout')),
+            )
+
+        print(
+            f"[RUNNER] init env_backend={getattr(self.cfg, 'env_backend', 'hardware')} "
+            f"num_envs={self.num_envs} parallel={self.is_parallel_sim} "
+            f"human_loop_mode={getattr(human_loop_cfg, 'mode', 'n/a') if human_loop_cfg is not None else 'n/a'}",
+        )
 
         self.max_episode_length = self._calculate_max_episode_length()
         
@@ -129,7 +149,12 @@ class RealEnvRunner(BaseEnvRunner):
     
     def _initialize_episode_manager(self):
         """Initialize episode manager"""
-        self.episode_manager = EpisodeManager(
+        self.episode_manager = self._build_episode_manager(
+            num_samples=self.cfg.failure_detection.num_samples
+        )
+
+    def _build_episode_manager(self, num_samples: int = 1):
+        return EpisodeManager(
             obs_rot_transformer=self.obs_rot_transformer,
             action_rot_transformer=self.action_rot_transformer,
             obs_feature_dim=self.obs_feature_dim,
@@ -140,8 +165,227 @@ class RealEnvRunner(BaseEnvRunner):
             To=self.To,
             Ta=self.Ta,
             device=self.device,
-            num_samples=self.cfg.failure_detection.num_samples
+            num_samples=num_samples
         )
+
+    def _run_parallel_sim_episode(self) -> List[Optional[Dict[str, Any]]]:
+        """Run one vectorized ManiSkill episode with per-env human-in-loop decisions."""
+        print(f"Running parallel simulation episode with num_envs={self.num_envs}")
+
+        self.robot_env.reset_robot(getattr(self.cfg, 'random_init', False), None)
+        managers = [self._build_episode_manager(num_samples=1) for _ in range(self.num_envs)]
+        episode_buffers = [
+            {
+                'tcp_pose': [],
+                'joint_pos': [],
+                'action': [],
+                'action_mode': [],
+                'wrist_cam': [],
+                'side_cam': []
+            }
+            for _ in range(self.num_envs)
+        ]
+
+        steps = np.zeros((self.num_envs,), dtype=np.int32)
+        env_finished = np.zeros((self.num_envs,), dtype=np.bool_)
+        env_discard = np.zeros((self.num_envs,), dtype=np.bool_)
+        env_teleop = np.zeros((self.num_envs,), dtype=np.bool_)
+        teleop_steps = np.zeros((self.num_envs,), dtype=np.int32)
+
+        for env_idx in range(self.num_envs):
+            state = self.robot_env.get_robot_state(env_idx=env_idx)
+            managers[env_idx].reset_observation_history()
+            for _ in range(self.To):
+                managers[env_idx].update_observation(
+                    state['policy_side_img'] / 255.0,
+                    state['policy_wrist_img'] / 255.0,
+                    state['tcp_pose'] if self.state_type == 'ee_pose' else state['joint_pos']
+                )
+            managers[env_idx].initialize_pose(state['tcp_pose'][:3], state['tcp_pose'][3:])
+
+        while not np.all(env_finished):
+            active_envs = [
+                i for i in range(self.num_envs)
+                if (not env_finished[i]) and (not env_teleop[i]) and steps[i] < self.max_episode_length
+            ]
+
+            env_action_seq = {}
+
+            for env_idx in active_envs:
+                state = self.robot_env.get_robot_state(env_idx=env_idx)
+                managers[env_idx].update_observation(
+                    state['policy_side_img'] / 255.0,
+                    state['policy_wrist_img'] / 255.0,
+                    state['tcp_pose'] if self.state_type == 'ee_pose' else state['joint_pos']
+                )
+                policy_obs = managers[env_idx].get_policy_observation()
+                with torch.no_grad():
+                    curr_action = self.policy.predict_action(policy_obs)
+                np_action_dict = dict_apply(curr_action, lambda x: x.detach().to('cpu').numpy())
+                env_action_seq[env_idx] = np_action_dict['action']
+
+            if self.sim_dashboard is not None:
+                payloads = {}
+                statuses = {}
+                for env_idx in range(self.num_envs):
+                    current_state = self.robot_env.get_robot_state(env_idx=env_idx)
+                    payloads[env_idx] = {
+                        'side_img': current_state['side_img_raw'],
+                        'wrist_img': current_state['wrist_img_raw'],
+                    }
+                    statuses[env_idx] = {
+                        'step': int(steps[env_idx]),
+                        'mode': 'teleop' if env_teleop[env_idx] else 'policy',
+                        'state': 'finished' if env_finished[env_idx] else ('discarded' if env_discard[env_idx] else 'running'),
+                        'decision': 'manual' if self.sim_hil_controller.mode == 'manual' else 'auto',
+                    }
+                self.sim_dashboard.show(payloads, statuses, banner=f"Episode {self.episode_idx}")
+
+            for step in range(self.Ta):
+                if not env_action_seq:
+                    break
+                tcp_actions = {}
+                gripper_actions = {}
+                per_step_actions = {}
+
+                for env_idx, action_seq in env_action_seq.items():
+                    if env_finished[env_idx]:
+                        continue
+                    deployed_action, gripper_action, _curr_p, _curr_r, curr_p_action, curr_r_action = \
+                        managers[env_idx].get_absolute_action_for_step(action_seq, step)
+                    tcp_actions[env_idx] = deployed_action
+                    gripper_actions[env_idx] = gripper_action[0]
+                    per_step_actions[env_idx] = (curr_p_action, curr_r_action, gripper_action[0])
+
+                if not tcp_actions:
+                    continue
+
+                self.robot_env.deploy_action_batch(tcp_actions, gripper_actions)
+
+                for env_idx in list(tcp_actions.keys()):
+                    state_data = self.robot_env.get_robot_state(env_idx=env_idx)
+                    curr_p_action, curr_r_action, grip = per_step_actions[env_idx]
+                    episode_buffers[env_idx]['wrist_cam'].append(state_data['demo_wrist_img'].permute(1, 2, 0).cpu().numpy().astype(np.uint8))
+                    episode_buffers[env_idx]['side_cam'].append(state_data['demo_side_img'].permute(1, 2, 0).cpu().numpy().astype(np.uint8))
+                    episode_buffers[env_idx]['tcp_pose'].append(state_data['tcp_pose'])
+                    episode_buffers[env_idx]['joint_pos'].append(state_data['joint_pos'])
+                    episode_buffers[env_idx]['action'].append(np.concatenate((curr_p_action, curr_r_action, [grip])))
+                    episode_buffers[env_idx]['action_mode'].append(ROBOT)
+                    steps[env_idx] += 1
+
+                    if step >= self.Ta - self.To + 1:
+                        managers[env_idx].update_observation(
+                            state_data['policy_side_img'] / 255.0,
+                            state_data['policy_wrist_img'] / 255.0,
+                            state_data['tcp_pose'] if self.state_type == 'ee_pose' else state_data['joint_pos']
+                        )
+
+            terminated, truncated = self.robot_env.get_env_done_flags()
+            for env_idx in range(self.num_envs):
+                if env_finished[env_idx]:
+                    continue
+                if terminated[env_idx]:
+                    env_finished[env_idx] = True
+                    continue
+                if truncated[env_idx] or steps[env_idx] >= self.max_episode_length:
+                    if self.sim_dashboard is not None:
+                        current_state = self.robot_env.get_robot_state(env_idx=env_idx)
+                        self.sim_dashboard.show(
+                            {env_idx: {'side_img': current_state['side_img_raw'], 'wrist_img': current_state['wrist_img_raw']}},
+                            {env_idx: {
+                                'step': int(steps[env_idx]),
+                                'mode': 'policy',
+                                'state': 'timeout' if truncated[env_idx] else 'max_step',
+                                'decision': 'awaiting',
+                                'error_reason': 'timeout / max step reached',
+                            }},
+                            banner=f"Episode {self.episode_idx} needs decision",
+                            error_text=f"env={env_idx}, step={int(steps[env_idx])}, reason=timeout_or_max_step",
+                        )
+                    decision = self.sim_hil_controller.decide(
+                        env_idx,
+                        'timeout',
+                        int(steps[env_idx]),
+                        key_provider=(self.sim_dashboard.wait_for_key if self.sim_dashboard is not None else None),
+                    )
+                    if decision.action == 'continue':
+                        env_teleop[env_idx] = True
+                        continue
+                    if decision.action == 'discard':
+                        env_discard[env_idx] = True
+                        env_finished[env_idx] = True
+                        continue
+                    if decision.action == 'finish':
+                        env_finished[env_idx] = True
+                        continue
+                    env_teleop[env_idx] = True
+
+            # Progress teleop envs while others continue policy rollout.
+            for env_idx in np.where(env_teleop)[0].tolist():
+                self.robot_env.set_active_env(env_idx)
+                curr_pose = managers[env_idx].last_p[0]
+                curr_rot = managers[env_idx].last_r[0]
+                teleop_data, _, _ = self.robot_env.human_teleop_step(curr_pose, curr_rot)
+                if teleop_data is not None:
+                    episode_buffers[env_idx]['wrist_cam'].append(teleop_data['demo_wrist_img'].permute(1, 2, 0).cpu().numpy().astype(np.uint8))
+                    episode_buffers[env_idx]['side_cam'].append(teleop_data['demo_side_img'].permute(1, 2, 0).cpu().numpy().astype(np.uint8))
+                    episode_buffers[env_idx]['tcp_pose'].append(teleop_data['tcp_pose'])
+                    episode_buffers[env_idx]['joint_pos'].append(teleop_data['joint_pos'])
+                    episode_buffers[env_idx]['action'].append(teleop_data['action'])
+                    episode_buffers[env_idx]['action_mode'].append(teleop_data['action_mode'])
+                    steps[env_idx] += 1
+
+                teleop_steps[env_idx] += 1
+                if self.robot_env.keyboard.infer:
+                    self.robot_env.keyboard.infer = False
+                    env_teleop[env_idx] = False
+                    teleop_steps[env_idx] = 0
+                    self.sim_hil_controller.clear_blocked(env_idx)
+                elif teleop_steps[env_idx] >= self.sim_hil_controller.max_teleop_steps:
+                    force_release = self.sim_hil_controller.mark_blocked_round(env_idx)
+                    if force_release:
+                        env_teleop[env_idx] = False
+                        teleop_steps[env_idx] = 0
+                        self.sim_hil_controller.clear_blocked(env_idx)
+
+                if self.sim_dashboard is not None:
+                    current_state = self.robot_env.get_robot_state(env_idx=env_idx)
+                    self.sim_dashboard.show(
+                        {env_idx: {'side_img': current_state['side_img_raw'], 'wrist_img': current_state['wrist_img_raw']}},
+                        {env_idx: {
+                            'step': int(steps[env_idx]),
+                            'mode': 'teleop',
+                            'state': 'intervening',
+                            'decision': 'teleop',
+                        }},
+                        banner=f"Episode {self.episode_idx} | env {env_idx} intervention",
+                    )
+
+                if steps[env_idx] >= self.max_episode_length:
+                    env_finished[env_idx] = True
+
+        episode_list = []
+        for env_idx in range(self.num_envs):
+            if env_discard[env_idx] or len(episode_buffers[env_idx]['action_mode']) == 0:
+                episode_list.append(None)
+                continue
+
+            episode = dict()
+            episode['wrist_cam'] = np.stack(episode_buffers[env_idx]['wrist_cam'], axis=0)
+            episode['side_cam'] = np.stack(episode_buffers[env_idx]['side_cam'], axis=0)
+            episode['tcp_pose'] = np.stack(episode_buffers[env_idx]['tcp_pose'], axis=0)
+            episode['joint_pos'] = np.stack(episode_buffers[env_idx]['joint_pos'], axis=0)
+            episode['action'] = np.stack(episode_buffers[env_idx]['action'], axis=0)
+            episode['action_mode'] = np.array(episode_buffers[env_idx]['action_mode'])
+            if episode['action_mode'].shape[0] % self.Ta != 0:
+                trim = episode['action_mode'].shape[0] % self.Ta
+                keep = episode['action_mode'].shape[0] - trim
+                for key in ['wrist_cam', 'side_cam', 'tcp_pose', 'joint_pos', 'action', 'action_mode']:
+                    episode[key] = episode[key][:keep]
+            episode['failure_indices'] = np.zeros((episode['action_mode'].shape[0],), dtype=np.bool_)
+            episode_list.append(episode)
+
+        return episode_list
     
     def _initialize_replay_buffer(self):
         """Initialize replay buffer for data collection"""
@@ -210,18 +454,41 @@ class RealEnvRunner(BaseEnvRunner):
         try:
             while True:
                 if self.robot_env.keyboard.quit:
+                    print("[RUNNER] quit flag detected, stopping rollout loop")
                     break
                 
                 print(f"Rollout episode: {self.episode_idx}")
                 
                 # Run single episode
-                episode_data = self._run_single_episode()
+                try:
+                    if self.is_parallel_sim:
+                        episode_data = self._run_parallel_sim_episode()
+                    else:
+                        episode_data = self._run_single_episode()
+                except Exception:
+                    if self.sim_dashboard is not None:
+                        import traceback
+
+                        error_text = traceback.format_exc()
+                        self.sim_dashboard.show_error(error_text, banner=f"Episode {self.episode_idx} failed")
+                        print(error_text)
+                    raise
                 
                 if episode_data is not None:
-                    # Save episode to replay buffer
-                    self.replay_buffer.add_episode(episode_data, compressors='disk')
-                    self.saved_episode_idx = self.replay_buffer.n_episodes - 1
-                    print(f'Saved episode {self.saved_episode_idx}')
+                    if isinstance(episode_data, list):
+                        print(f"[RUNNER] collected {len([ep for ep in episode_data if ep is not None])} parallel episodes")
+                        for ep in episode_data:
+                            if ep is None:
+                                print("[RUNNER] skipped discarded parallel episode")
+                                continue
+                            self.replay_buffer.add_episode(ep, compressors='disk')
+                            self.saved_episode_idx = self.replay_buffer.n_episodes - 1
+                            print(f'Saved episode {self.saved_episode_idx}')
+                    else:
+                        # Save episode to replay buffer
+                        self.replay_buffer.add_episode(episode_data, compressors='disk')
+                        self.saved_episode_idx = self.replay_buffer.n_episodes - 1
+                        print(f'Saved episode {self.saved_episode_idx}')
                 
                 # Reset robot between episodes
                 self.robot_env.reset_robot()
@@ -258,8 +525,10 @@ class RealEnvRunner(BaseEnvRunner):
         random_init_pose = None
         if getattr(self.cfg, 'random_init', False):
             random_init_pose = self.robot_env.robot.init_pose + np.random.uniform(-0.1, 0.1, size=7)
+            print(f"[RUNNER] random_init enabled, pose_offset={np.round(random_init_pose - self.robot_env.robot.init_pose, 4)}")
         
         robot_state = self.robot_env.reset_robot(getattr(self.cfg, 'random_init', False), random_init_pose)
+        print(f"[RUNNER] episode={self.episode_idx} reset complete, initial j={self.j if hasattr(self, 'j') else 0}")
         
         # Initialize episode manager
         self.episode_manager.reset_observation_history()
@@ -339,6 +608,18 @@ class RealEnvRunner(BaseEnvRunner):
             
             # Get robot state and observations
             robot_state = self.robot_env.get_robot_state()
+
+            if self.sim_dashboard is not None:
+                self.sim_dashboard.show(
+                    {0: {'side_img': robot_state['side_img_raw'], 'wrist_img': robot_state['wrist_img_raw']}},
+                    {0: {
+                        'step': int(self.j),
+                        'mode': 'policy',
+                        'state': 'running',
+                        'decision': 'single-env',
+                    }},
+                    banner=f"Episode {self.episode_idx} | single-env policy rollout",
+                )
             
             # Update observation history
             self.episode_manager.update_observation(
@@ -409,6 +690,7 @@ class RealEnvRunner(BaseEnvRunner):
                     timestep=self.j,
                     max_episode_length=self.max_episode_length
                 )
+                print(f"[RUNNER] failure_detection step={self.j} flag={failure_flag} reason={failure_reason}")
 
                 if self.j >= self.max_episode_length: # Making sure that every failure detection result is processed before raising timeout
                     failure_flag, failure_reason, _ = self.failure_detection_module.wait_for_final_results(self.j)
@@ -421,11 +703,27 @@ class RealEnvRunner(BaseEnvRunner):
                     else:
                         print("Maximum episode length reached!")
 
+                    if self.sim_dashboard is not None:
+                        self.sim_dashboard.show(
+                            {0: {'side_img': robot_state['side_img_raw'], 'wrist_img': robot_state['wrist_img_raw']}},
+                            {0: {
+                                'step': int(self.j),
+                                'mode': 'policy',
+                                'state': 'failure' if failure_flag else 'max_step',
+                                'decision': 'awaiting intervention',
+                                'error_reason': failure_reason or 'maximum episode length reached',
+                            }},
+                            banner=f"Episode {self.episode_idx} requires intervention",
+                            error_text=failure_reason or 'maximum episode length reached',
+                        )
+
                     if self.is_sim:
                         # In simulation we avoid blocking for hardware keyboard input.
                         if self.j < self.max_episode_length and failure_flag:
+                            print("[RUNNER] sim fallback -> entering human intervention due to failure")
                             self.robot_env.keyboard.help = True
                             break
+                        print("[RUNNER] sim fallback -> entering human intervention due to timeout/max step")
                         self.robot_env.keyboard.help = True
                         break
                     else:
@@ -454,6 +752,7 @@ class RealEnvRunner(BaseEnvRunner):
     def _run_human_intervention(self, detach_pos: np.ndarray, detach_rot: R) -> Dict[str, Any]:
         """Run human intervention loop"""
         print("============ Human intervention =============")
+        print(f"[RUNNER] intervention entry j={self.j} detach_pos={np.round(detach_pos, 4)}")
         
         # Reset help signal
         self.robot_env.keyboard.help = False
@@ -461,6 +760,7 @@ class RealEnvRunner(BaseEnvRunner):
         # Perform rewinding if needed
         if self.failure_detection_module and hasattr(self.failure_detection_module, 'should_stop_rewinding'):
             curr_pos, curr_rot = self._rewind_robot()
+            print("[RUNNER] rewind completed by failure detector / fallback path")
         
         # Get current pose for human teleop
         last_p = curr_pos if 'curr_pos' in locals() else self.episode_manager.last_p[0]
@@ -471,6 +771,7 @@ class RealEnvRunner(BaseEnvRunner):
         rotation = detach_rot.inv() * last_r
         self.robot_env.sigma.resume()
         self.robot_env.sigma.transform_from_robot(translate, rotation)
+        print(f"[RUNNER] teleop transform translate={np.round(translate, 4)}")
         
         # Human intervention loop
         while (not self.robot_env.keyboard.finish and not self.robot_env.keyboard.discard and not self.robot_env.keyboard.infer) or self.j % self.Ta:
@@ -478,6 +779,18 @@ class RealEnvRunner(BaseEnvRunner):
             teleop_data, last_p, last_r = self.robot_env.human_teleop_step(last_p, last_r)
             
             if teleop_data is None:
+                print("[RUNNER] teleop step returned None -> simulated teleop fallback / waiting")
+                if self.sim_dashboard is not None:
+                    self.sim_dashboard.show(
+                        {0: {'side_img': self.robot_env.get_robot_state()['side_img_raw'], 'wrist_img': self.robot_env.get_robot_state()['wrist_img_raw']}},
+                        {0: {
+                            'step': int(self.j),
+                            'mode': 'teleop',
+                            'state': 'waiting',
+                            'decision': 'auto fallback',
+                        }},
+                        banner=f"Episode {self.episode_idx} | waiting for simulated teleop",
+                    )
                 continue
             
             # Update observation history with latest state
@@ -496,6 +809,19 @@ class RealEnvRunner(BaseEnvRunner):
             self.episode_buffers['action_mode'].append(teleop_data['action_mode'])
             
             self.j += 1
+            print(f"[RUNNER] teleop step accepted, new j={self.j}")
+
+            if self.sim_dashboard is not None:
+                self.sim_dashboard.show(
+                    {0: {'side_img': teleop_data['demo_side_img'].permute(1, 2, 0).cpu().numpy().astype(np.uint8), 'wrist_img': teleop_data['demo_wrist_img'].permute(1, 2, 0).cpu().numpy().astype(np.uint8)}},
+                    {0: {
+                        'step': int(self.j),
+                        'mode': 'teleop',
+                        'state': 'intervening',
+                        'decision': 'teleop',
+                    }},
+                    banner=f"Episode {self.episode_idx} | human intervention",
+                )
         
         # Reset target pose tracking after human intervention
         self.episode_manager.initialize_pose(last_p, last_r.as_quat(scalar_first=True))
@@ -503,6 +829,7 @@ class RealEnvRunner(BaseEnvRunner):
         # Reset signals
         self.robot_env.keyboard.infer = False
         new_detach_pos, new_detach_rot = self.robot_env.detach_sigma()
+        print(f"[RUNNER] intervention exit new_detach_pos={np.round(new_detach_pos, 4)}")
         
         return {'detach_pos': new_detach_pos, 'detach_rot': new_detach_rot}
     
@@ -519,6 +846,7 @@ class RealEnvRunner(BaseEnvRunner):
             prev_side_cam, prev_wrist_cam, curr_pos, curr_rot = self._rewind_with_failure_detection(curr_pos, curr_rot)
         else:
             prev_side_cam, prev_wrist_cam, curr_pos, curr_rot = self._rewind_simple(curr_pos, curr_rot)
+        print("[RUNNER] rewind finished, preparing reference alignment")
         
         # Prepare for human intervention by showing reference scene
         if "prev_side_cam" in locals():
@@ -532,30 +860,62 @@ class RealEnvRunner(BaseEnvRunner):
     def _rewind_with_failure_detection(self, curr_pos: np.ndarray, curr_rot: R) -> Tuple[np.ndarray, np.ndarray, np.ndarray, R]:
         """Rewind with failure detection module guidance"""
         curr_timestep = self.j
+        prev_side_cam = None
+        prev_wrist_cam = None
+        print(f"[RUNNER] rewind_with_failure_detection start j={self.j}")
         
         for _ in range(curr_timestep):
             if not self.failure_detection_module.rewind_step(self.j, self.episode_buffers, curr_timestep):
+                print(f"[RUNNER] rewind stopped by failure detector at j={self.j}")
                 break
             # Rewind one step on robot
             curr_pos, curr_rot, prev_side_cam, prev_wrist_cam = self._rewind_single_step(curr_pos, curr_rot)
             self.j -= 1
+            print(f"[RUNNER] rewind step complete, j={self.j}")
+
+        if prev_side_cam is None or prev_wrist_cam is None:
+            if len(self.episode_buffers['side_cam']) > 0 and len(self.episode_buffers['wrist_cam']) > 0:
+                prev_side_cam = self.episode_buffers['side_cam'][-1]
+                prev_wrist_cam = self.episode_buffers['wrist_cam'][-1]
+                print("[RUNNER] rewind fallback -> using latest buffered frame as reference")
+            else:
+                state_data = self.robot_env.get_robot_state()
+                prev_side_cam = state_data['side_img_raw']
+                prev_wrist_cam = state_data['wrist_img_raw']
+                print("[RUNNER] rewind fallback -> using current env render as reference")
         
         return prev_side_cam, prev_wrist_cam, curr_pos, curr_rot
     
     def _rewind_simple(self, curr_pos: np.ndarray, curr_rot: R) -> Tuple[np.ndarray, np.ndarray, np.ndarray, R]:
         """Simple rewinding with step limit"""
         curr_timestep = self.j
+        prev_side_cam = None
+        prev_wrist_cam = None
+        print(f"[RUNNER] rewind_simple start j={self.j}")
         
         for i in range(curr_timestep):
             # Simple stop condition: limit to 3 Ta-step chunks
             if self.j % self.Ta == 0 and self.j > 0:
                 if i // self.Ta >= 3:
                     print("Stop rewinding (reached 3 Ta-step limit).")
+                    print(f"[RUNNER] rewind_simple stop reason=step_limit i={i} j={self.j}")
                     break
             
             # Rewind one step
             curr_pos, curr_rot, prev_side_cam, prev_wrist_cam = self._rewind_single_step(curr_pos, curr_rot)
             self.j -= 1
+            print(f"[RUNNER] rewind_simple step complete, j={self.j}")
+
+        if prev_side_cam is None or prev_wrist_cam is None:
+            if len(self.episode_buffers['side_cam']) > 0 and len(self.episode_buffers['wrist_cam']) > 0:
+                prev_side_cam = self.episode_buffers['side_cam'][-1]
+                prev_wrist_cam = self.episode_buffers['wrist_cam'][-1]
+                print("[RUNNER] rewind_simple fallback -> using latest buffered frame as reference")
+            else:
+                state_data = self.robot_env.get_robot_state()
+                prev_side_cam = state_data['side_img_raw']
+                prev_wrist_cam = state_data['wrist_img_raw']
+                print("[RUNNER] rewind_simple fallback -> using current env render as reference")
         
         return prev_side_cam, prev_wrist_cam, curr_pos, curr_rot
     
@@ -571,6 +931,7 @@ class RealEnvRunner(BaseEnvRunner):
         
         # Rewind robot by applying inverse action
         curr_pos, curr_rot = self.robot_env.rewind_robot(curr_pos, curr_rot, prev_action)
+        print(f"[RUNNER] rewind_single_step applied inverse action, remaining buffers={len(self.episode_buffers['action'])}")
         
         return curr_pos, curr_rot, prev_side_cam, prev_wrist_cam
     
@@ -605,6 +966,10 @@ class RealEnvRunner(BaseEnvRunner):
         # Cleanup failure detection module
         if self.failure_detection_module and hasattr(self.failure_detection_module, 'cleanup'):
             self.failure_detection_module.cleanup()
+
+        if self.sim_dashboard is not None:
+            self.sim_dashboard.close()
         
         print("Saved replay buffer to", save_zarr_path)
+        print("[RUNNER] cleanup complete")
         torch.distributed.destroy_process_group() 

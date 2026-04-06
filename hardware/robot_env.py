@@ -43,16 +43,16 @@ class RobotEnv:
         # Setup image processors
         BICUBIC = InterpolationMode.BICUBIC
         self.policy_side_image_processor = Compose([
-            Resize((img_shape[1]+8, img_shape[2]+8), interpolation=BICUBIC),
+            Resize((img_shape[1]+8, img_shape[2]+8), interpolation=BICUBIC, antialias=True),
             CenterCrop((img_shape[1], img_shape[2]))
         ])
         self.policy_wrist_image_processor = Compose([
-            Resize((img_shape[1]+8, img_shape[2]+8), interpolation=BICUBIC),
+            Resize((img_shape[1]+8, img_shape[2]+8), interpolation=BICUBIC, antialias=True),
             CenterCrop((img_shape[1], img_shape[2]))
         ])
 
         self.demo_image_processor = Compose([
-            Resize((img_shape[1]+8, img_shape[2]+8), interpolation=BICUBIC),
+            Resize((img_shape[1]+8, img_shape[2]+8), interpolation=BICUBIC, antialias=True),
         ])
         
         # Keep track of throttle usage for human intervention
