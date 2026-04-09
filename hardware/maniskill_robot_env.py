@@ -1,4 +1,7 @@
 import time
+import os
+import select
+import sys
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -54,6 +57,14 @@ class ManiSkillRobotEnv:
         self.max_snapshot_steps = int(cfg.get("max_snapshot_steps", 5000))
         self.auto_intervention_steps = int(cfg.get("auto_intervention_steps", 8))
         self.gripper_max_width = float(cfg.get("gripper_max_width", 0.09))
+        self.teleop_pos_step = float(cfg.get("teleop_pos_step", 0.01))
+        self.teleop_rot_step_deg = float(cfg.get("teleop_rot_step_deg", 6.0))
+        self.teleop_gripper_step = float(cfg.get("teleop_gripper_step", 0.01))
+        self.teleop_show_help = bool(cfg.get("teleop_show_help", True))
+        self.teleop_use_cv2_keys = bool(cfg.get("teleop_use_cv2_keys", True))
+        self.teleop_terminal_poll_timeout_s = float(cfg.get("teleop_terminal_poll_timeout_s", 0.2))
+        self.teleop_no_input_log_interval_s = float(cfg.get("teleop_no_input_log_interval_s", 2.0))
+        self._has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
         self.env = gym.make(
             self.env_id,
@@ -110,6 +121,10 @@ class ManiSkillRobotEnv:
         self.active_env_idx = 0
         self.last_terminated = np.zeros((self.num_envs,), dtype=np.bool_)
         self.last_truncated = np.zeros((self.num_envs,), dtype=np.bool_)
+        self._teleop_help_printed = False
+        self._stdin_hint_printed = False
+        self._stdin_unavailable_warned = False
+        self._last_no_input_log_time = 0.0
 
     def _to_numpy(self, value):
         if isinstance(value, torch.Tensor):
@@ -215,6 +230,8 @@ class ManiSkillRobotEnv:
         self.keyboard.ctn = False
         self.keyboard.help = False
         self.keyboard.infer = False
+        self.keyboard.finish = False
+        self.keyboard.discard = False
 
         self.last_obs, self.last_info = self.env.reset(seed=self.seed)
         tcp_pose = self._extract_tcp_pose(self.last_obs, self.active_env_idx)
@@ -224,6 +241,10 @@ class ManiSkillRobotEnv:
         self.last_gripper_width = self.gripper_max_width
         self.last_terminated[:] = False
         self.last_truncated[:] = False
+        self._teleop_help_printed = False
+        self._stdin_hint_printed = False
+        self._stdin_unavailable_warned = False
+        self._last_no_input_log_time = 0.0
 
         self._snapshots = []
         self._capture_snapshot()
@@ -370,23 +391,128 @@ class ManiSkillRobotEnv:
     def get_env_done_flags(self):
         return self.last_terminated.copy(), self.last_truncated.copy()
 
+    def _poll_keyboard_key(self) -> Optional[str]:
+        if self.teleop_use_cv2_keys and self._has_display:
+            try:
+                key_code = cv2.waitKey(0)  # Wait indefinitely for a key press
+                if key_code != -1:
+                    try:
+                        return chr(key_code & 0xFF).lower()
+                    except ValueError:
+                        pass
+            except Exception as exc:
+                self._has_display = False
+                print(f"[SIM TELEOP] OpenCV key polling disabled due to display error: {exc}")
+
+        if sys.stdin.isatty():
+            if not self._stdin_hint_printed:
+                print("[SIM TELEOP] Reading keyboard input from terminal. Type key followed by Enter.")
+                self._stdin_hint_printed = True
+            try:
+                timeout = self.teleop_terminal_poll_timeout_s if not self._has_display else 0.0
+                if select.select([sys.stdin], [], [], timeout)[0]:
+                    text = sys.stdin.readline().strip().lower()
+                    if text:
+                        return text[0]
+            except Exception:
+                return None
+        else:
+            if not self._stdin_unavailable_warned and not self._has_display:
+                print("[SIM TELEOP] No interactive stdin available in headless mode; keyboard teleop input is unavailable.")
+                self._stdin_unavailable_warned = True
+
+        now = time.time()
+        if now - self._last_no_input_log_time >= self.teleop_no_input_log_interval_s:
+            print("[SIM TELEOP] No keyboard input detected.")
+            self._last_no_input_log_time = now
+        return None
+
+    def _print_teleop_help_once(self):
+        if not self.teleop_show_help or self._teleop_help_printed:
+            return
+        input_suffix = " (type key then Enter in terminal)" if (not self._has_display) else ""
+        print(
+            "[SIM TELEOP] Keyboard controls:\n"
+            "  Translation: W/S (+/-X), A/Z (+/-Y), R/V (+/-Z)\n"
+            "  Rotation:    U/J (+/-Roll), I/K (+/-Pitch), O/L (+/-Yaw)\n"
+            "  Gripper:     N (close), M (open)\n"
+            f"  Control:     C (return to policy), F (finish), D (discard), Q (quit){input_suffix}",
+            flush=True,
+        )
+        self._teleop_help_printed = True
+
     def human_teleop_step(self, last_p, last_r):
-        # Sim teleop compatibility: execute tiny/no-op actions and hand control back automatically.
         start_time = time.time()
         self._teleop_steps += 1
+        self._print_teleop_help_once()
+
+        key = self._poll_keyboard_key()
+        dp = np.zeros(3, dtype=np.float32)
+        d_rotvec = np.zeros(3, dtype=np.float32)
+        gripper_action = float(self.last_gripper_width)
+        print(f'[SIM TELEOP] Step {self._teleop_steps}, key: {key}, dp: {dp}, d_rotvec: {d_rotvec}, gripper_action: {gripper_action}')
+        if key == "q":
+            self.keyboard.quit = True
+        elif key == "f":
+            self.keyboard.finish = True
+        elif key == "d":
+            self.keyboard.discard = True
+        elif key == "c":
+            self.keyboard.infer = True
+        elif key == "w":
+            dp[0] += self.teleop_pos_step
+        elif key == "s":
+            dp[0] -= self.teleop_pos_step
+        elif key == "a":
+            dp[1] += self.teleop_pos_step
+        elif key == "z":
+            dp[1] -= self.teleop_pos_step
+        elif key == "r":
+            dp[2] += self.teleop_pos_step
+        elif key == "v":
+            dp[2] -= self.teleop_pos_step
+        elif key == "u":
+            d_rotvec[0] += np.deg2rad(self.teleop_rot_step_deg)
+        elif key == "j":
+            d_rotvec[0] -= np.deg2rad(self.teleop_rot_step_deg)
+        elif key == "i":
+            d_rotvec[1] += np.deg2rad(self.teleop_rot_step_deg)
+        elif key == "k":
+            d_rotvec[1] -= np.deg2rad(self.teleop_rot_step_deg)
+        elif key == "o":
+            d_rotvec[2] += np.deg2rad(self.teleop_rot_step_deg)
+        elif key == "l":
+            d_rotvec[2] -= np.deg2rad(self.teleop_rot_step_deg)
+        elif key == "n":
+            gripper_action = float(np.clip(self.last_gripper_width - self.teleop_gripper_step, 0.0, self.gripper_max_width))
+        elif key == "m":
+            gripper_action = float(np.clip(self.last_gripper_width + self.teleop_gripper_step, 0.0, self.gripper_max_width))
+
+        curr_p_action = dp
+        if np.linalg.norm(d_rotvec) > 0:
+            curr_r_action = R.from_rotvec(d_rotvec.astype(np.float64)).as_quat(scalar_first=True).astype(np.float32)
+        else:
+            curr_r_action = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        target_p = np.asarray(last_p, dtype=np.float32) + dp
+        target_r = last_r * R.from_rotvec(d_rotvec.astype(np.float64))
+
+        control_signal_set = self.keyboard.infer or self.keyboard.finish or self.keyboard.discard or self.keyboard.quit
+        has_motion = (np.linalg.norm(dp) > 0) or (np.linalg.norm(d_rotvec) > 0)
+        has_gripper_update = abs(gripper_action - float(self.last_gripper_width)) > 1e-8
+
+        if has_motion or has_gripper_update:
+            target_pose = np.concatenate((target_p, target_r.as_quat(scalar_first=True).astype(np.float32)), axis=0)
+            self.deploy_action(target_pose, gripper_action)
+            last_p = target_p
+            last_r = target_r
+        elif control_signal_set:
+            time.sleep(max(1 / self.fps - (time.time() - start_time), 0))
+            return None, last_p, last_r
 
         state_data = self.get_robot_state()
         tcp_pose = state_data["tcp_pose"]
         joint_pos = state_data["joint_pos"]
-
-        curr_p_action = np.zeros(3, dtype=np.float32)
-        curr_r_action = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        gripper_action = self.last_gripper_width
-
-        self.deploy_action(np.concatenate([last_p, last_r.as_quat(scalar_first=True)]), gripper_action)
-
-        if self._teleop_steps >= self.auto_intervention_steps:
-            self.keyboard.infer = True
 
         processed_data = {
             "policy_wrist_img": state_data["policy_wrist_img"],
@@ -400,7 +526,7 @@ class ManiSkillRobotEnv:
         }
 
         time.sleep(max(1 / self.fps - (time.time() - start_time), 0))
-        return processed_data, last_p, last_r
+        return processed_data, np.asarray(last_p, dtype=np.float32), last_r
 
     def rewind_robot(self, curr_pos, curr_rot, inverse_action):
         _ = inverse_action

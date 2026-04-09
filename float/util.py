@@ -9,6 +9,18 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 import os
 
 
+def _as_2d_float_tensor(x: Tensor, device: Optional[torch.device] = None) -> Tensor:
+    """Normalize latent tensors to 2D float32 on a consistent device."""
+    if not isinstance(x, torch.Tensor):
+        x = torch.as_tensor(x)
+    x = x.to(dtype=torch.float32)
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    if device is not None:
+        x = x.to(device)
+    return x
+
+
 def euclidean_distance(x, y):
     "Returns the matrix of $|x_i-y_j|^p$."
     x_col = x.unsqueeze(1)
@@ -18,6 +30,9 @@ def euclidean_distance(x, y):
 
 
 def cosine_distance(x: Tensor, y: Tensor):
+    # Keep matrix multiplication numerically and dtype consistent.
+    x = _as_2d_float_tensor(x)
+    y = _as_2d_float_tensor(y, device=x.device)
     C = torch.mm(x, y.T) #（n_x, dim)，（n_y, dim) -> (n_x,n_y)
     x_norm = torch.norm(x, p=2, dim=1)
     y_norm = torch.norm(y, p=2, dim=1)
@@ -35,6 +50,9 @@ def optimal_transport_plan(
     niter: int = 1000,
     epsilon: float = 0.1
 ) -> Tensor:
+    X = _as_2d_float_tensor(X)
+    Y = _as_2d_float_tensor(Y, device=X.device)
+    cost_matrix = _as_2d_float_tensor(cost_matrix, device=X.device)
     X_pot = np.ones(X.shape[0]) * (1 / X.shape[0])
     Y_pot = np.ones(Y.shape[0]) * (1 / Y.shape[0])  #X_pot and Y_pot conforms to uniform distribution
     c_m = cost_matrix.data.detach().cpu().numpy()
@@ -54,7 +72,9 @@ def rematch_expert_episode(
     use OT to sort by total transport cost, getting candidate expert indices from lowest to highest cost
     """
     ot_costs = []
+    curr_rollout_latent = _as_2d_float_tensor(curr_rollout_latent)
     for expert_latent in candidate_expert_latent:
+        expert_latent = _as_2d_float_tensor(expert_latent, device=curr_rollout_latent.device)
         dist_mat = cosine_distance(expert_latent, curr_rollout_latent) # Cost matrix
         ot_plan = optimal_transport_plan(expert_latent, curr_rollout_latent, dist_mat) # Sinkhorn algorithm to solve transport plan
         ot_cost = torch.sum(ot_plan * dist_mat) # Total transport cost OT_cost, element-wise product of cost matrix and transport plan
@@ -74,7 +94,9 @@ def find_matching_expert_demo(
     
     all_transport_costs = []
     
+    rollout_init_latent = _as_2d_float_tensor(rollout_init_latent, device=device)
     for human_latent in all_human_latent:
+        human_latent = _as_2d_float_tensor(human_latent, device=device)
         cost_mat = cosine_distance(human_latent, rollout_init_latent).to(device).detach()
         transport_plan = optimal_transport_plan(human_latent, rollout_init_latent, cost_mat)
         transport_cost = torch.sum(transport_plan * cost_mat, dim=0).squeeze()

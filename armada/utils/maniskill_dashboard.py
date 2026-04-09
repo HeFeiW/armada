@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import textwrap
 from typing import Dict, Optional, Sequence
 
@@ -28,13 +29,22 @@ class ManiSkillRolloutDashboard:
         self.panel_height = panel_height
         self.max_error_lines = max_error_lines
         self._window_ready = False
+        self._display_available = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        if self.enabled and not self._display_available:
+            self.enabled = False
+            print("[DASHBOARD] GUI disabled: no DISPLAY/WAYLAND_DISPLAY found; running headless.")
 
     def _ensure_window(self):
         if not self.enabled or self._window_ready:
             return
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        self._window_ready = True
-        print(f"[DASHBOARD] opened window: {self.window_name}")
+        try:
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            self._window_ready = True
+            print(f"[DASHBOARD] opened window: {self.window_name}")
+        except Exception as exc:
+            self.enabled = False
+            self._window_ready = False
+            print(f"[DASHBOARD] GUI disabled due to OpenCV window error: {exc}")
 
     def _resize_rgb(self, image: np.ndarray) -> np.ndarray:
         if image is None:

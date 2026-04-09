@@ -191,6 +191,8 @@ class RealEnvRunner(BaseEnvRunner):
         env_discard = np.zeros((self.num_envs,), dtype=np.bool_)
         env_teleop = np.zeros((self.num_envs,), dtype=np.bool_)
         teleop_steps = np.zeros((self.num_envs,), dtype=np.int32)
+        teleop_last_p = [None for _ in range(self.num_envs)]
+        teleop_last_r = [None for _ in range(self.num_envs)]
 
         for env_idx in range(self.num_envs):
             state = self.robot_env.get_robot_state(env_idx=env_idx)
@@ -309,7 +311,7 @@ class RealEnvRunner(BaseEnvRunner):
                         key_provider=(self.sim_dashboard.wait_for_key if self.sim_dashboard is not None else None),
                     )
                     if decision.action == 'continue':
-                        env_teleop[env_idx] = True
+                        env_teleop[env_idx] = False
                         continue
                     if decision.action == 'discard':
                         env_discard[env_idx] = True
@@ -318,30 +320,64 @@ class RealEnvRunner(BaseEnvRunner):
                     if decision.action == 'finish':
                         env_finished[env_idx] = True
                         continue
+                    # Enter teleop and initialize per-env teleop pose tracking.
+                    self.robot_env.keyboard.infer = False
+                    self.robot_env.keyboard.finish = False
+                    self.robot_env.keyboard.discard = False
+                    teleop_last_p[env_idx] = managers[env_idx].last_p[0].copy()
+                    teleop_last_r[env_idx] = managers[env_idx].last_r[0]
+                    teleop_steps[env_idx] = 0
                     env_teleop[env_idx] = True
 
             # Progress teleop envs while others continue policy rollout.
             for env_idx in np.where(env_teleop)[0].tolist():
                 self.robot_env.set_active_env(env_idx)
-                curr_pose = managers[env_idx].last_p[0]
-                curr_rot = managers[env_idx].last_r[0]
-                teleop_data, _, _ = self.robot_env.human_teleop_step(curr_pose, curr_rot)
+                curr_pose = teleop_last_p[env_idx] if teleop_last_p[env_idx] is not None else managers[env_idx].last_p[0]
+                curr_rot = teleop_last_r[env_idx] if teleop_last_r[env_idx] is not None else managers[env_idx].last_r[0]
+                teleop_data, new_last_p, new_last_r = self.robot_env.human_teleop_step(curr_pose, curr_rot)
                 if teleop_data is not None:
+                    teleop_last_p[env_idx] = new_last_p
+                    teleop_last_r[env_idx] = new_last_r
                     episode_buffers[env_idx]['wrist_cam'].append(teleop_data['demo_wrist_img'].permute(1, 2, 0).cpu().numpy().astype(np.uint8))
                     episode_buffers[env_idx]['side_cam'].append(teleop_data['demo_side_img'].permute(1, 2, 0).cpu().numpy().astype(np.uint8))
                     episode_buffers[env_idx]['tcp_pose'].append(teleop_data['tcp_pose'])
                     episode_buffers[env_idx]['joint_pos'].append(teleop_data['joint_pos'])
                     episode_buffers[env_idx]['action'].append(teleop_data['action'])
                     episode_buffers[env_idx]['action_mode'].append(teleop_data['action_mode'])
+                    managers[env_idx].update_observation(
+                        teleop_data['policy_side_img'] / 255.0,
+                        teleop_data['policy_wrist_img'] / 255.0,
+                        teleop_data['tcp_pose'] if self.state_type == 'ee_pose' else teleop_data['joint_pos']
+                    )
+                    managers[env_idx].initialize_pose(new_last_p, new_last_r.as_quat(scalar_first=True))
                     steps[env_idx] += 1
-
-                teleop_steps[env_idx] += 1
-                if self.robot_env.keyboard.infer:
+                elif self.robot_env.keyboard.quit:
+                    env_finished[:] = True
+                    break
+                elif self.robot_env.keyboard.infer:
                     self.robot_env.keyboard.infer = False
                     env_teleop[env_idx] = False
                     teleop_steps[env_idx] = 0
                     self.sim_hil_controller.clear_blocked(env_idx)
-                elif teleop_steps[env_idx] >= self.sim_hil_controller.max_teleop_steps:
+                    continue
+                elif self.robot_env.keyboard.discard:
+                    self.robot_env.keyboard.discard = False
+                    env_discard[env_idx] = True
+                    env_finished[env_idx] = True
+                    env_teleop[env_idx] = False
+                    teleop_steps[env_idx] = 0
+                    self.sim_hil_controller.clear_blocked(env_idx)
+                    continue
+                elif self.robot_env.keyboard.finish:
+                    self.robot_env.keyboard.finish = False
+                    env_finished[env_idx] = True
+                    env_teleop[env_idx] = False
+                    teleop_steps[env_idx] = 0
+                    self.sim_hil_controller.clear_blocked(env_idx)
+                    continue
+
+                teleop_steps[env_idx] += 1
+                if teleop_steps[env_idx] >= self.sim_hil_controller.max_teleop_steps:
                     force_release = self.sim_hil_controller.mark_blocked_round(env_idx)
                     if force_release:
                         env_teleop[env_idx] = False
@@ -574,7 +610,7 @@ class RealEnvRunner(BaseEnvRunner):
                 init_policy_obs[key] = value[0:1]
             with torch.no_grad():
                 init_latent = self.policy.extract_latent(init_policy_obs)
-                init_latent = init_latent.reshape(-1)
+                init_latent = init_latent.reshape(-1).to(dtype=torch.float32)
             self.failure_detection_module.process_step({
                 'step_type': 'episode_start',
                 'episode_idx': self.episode_idx,
@@ -598,6 +634,11 @@ class RealEnvRunner(BaseEnvRunner):
             if self.robot_env.keyboard.help:
                 intervention_result = self._run_human_intervention(detach_pos, detach_rot)
                 detach_pos, detach_rot = intervention_result['detach_pos'], intervention_result['detach_rot']
+
+            if self.robot_env.keyboard.quit:
+                print("[RUNNER] quit flag detected during human intervention, stopping episode")
+                self.robot_env.keyboard.finish = True
+                break
             
             # Check if episode should finish
             if self.robot_env.keyboard.discard:
@@ -768,8 +809,11 @@ class RealEnvRunner(BaseEnvRunner):
         print("============ Human intervention =============")
         print(f"[RUNNER] intervention entry j={self.j} detach_pos={np.round(detach_pos, 4)}")
         
-        # Reset help signal
+        # Reset intervention signals to avoid stale state skipping teleop loop.
         self.robot_env.keyboard.help = False
+        self.robot_env.keyboard.infer = False
+        self.robot_env.keyboard.finish = False
+        self.robot_env.keyboard.discard = False
         
         # Perform rewinding if needed
         if self.failure_detection_module and hasattr(self.failure_detection_module, 'should_stop_rewinding'):
@@ -788,11 +832,14 @@ class RealEnvRunner(BaseEnvRunner):
         print(f"[RUNNER] teleop transform translate={np.round(translate, 4)}")
         
         # Human intervention loop
-        while (not self.robot_env.keyboard.finish and not self.robot_env.keyboard.discard and not self.robot_env.keyboard.infer) or self.j % self.Ta:
+        while not (self.robot_env.keyboard.finish or self.robot_env.keyboard.discard or self.robot_env.keyboard.infer or self.robot_env.keyboard.quit):
             # Execute one step of human teleop
             teleop_data, last_p, last_r = self.robot_env.human_teleop_step(last_p, last_r)
-            
+            print(f"[RUNNER] Teleop data is None: {teleop_data is None}")
             if teleop_data is None:
+                if self.robot_env.keyboard.quit or self.robot_env.keyboard.finish or self.robot_env.keyboard.discard or self.robot_env.keyboard.infer:
+                    print("[RUNNER] teleop exit requested -> leaving human intervention")
+                    break
                 print("[RUNNER] teleop step returned None -> simulated teleop fallback / waiting")
                 if self.sim_dashboard is not None:
                     self.sim_dashboard.show(
@@ -839,6 +886,12 @@ class RealEnvRunner(BaseEnvRunner):
         
         # Reset target pose tracking after human intervention
         self.episode_manager.initialize_pose(last_p, last_r.as_quat(scalar_first=True))
+
+        # Drop stale async failure-detection tasks/results generated before intervention.
+        if self.failure_detection_module and hasattr(self.failure_detection_module, 'empty_queue'):
+            self.failure_detection_module.empty_queue()
+        if self.failure_detection_module and hasattr(self.failure_detection_module, 'empty_result_queue'):
+            self.failure_detection_module.empty_result_queue()
         
         # Reset signals
         self.robot_env.keyboard.infer = False

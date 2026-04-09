@@ -32,6 +32,12 @@ maniskill:
   max_snapshot_steps: 5000
   auto_intervention_steps: ${Ta}
   gripper_max_width: 0.09
+  teleop_pos_step: 0.01
+  teleop_rot_step_deg: 6.0
+  teleop_gripper_step: 0.01
+  teleop_show_help: true
+  teleop_terminal_poll_timeout_s: 0.2
+  teleop_no_input_log_interval_s: 2.0
 
 # Human-in-loop for simulation
 human_loop:
