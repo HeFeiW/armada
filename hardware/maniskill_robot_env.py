@@ -92,7 +92,10 @@ class ManiSkillRobotEnv:
             ]
         )
         self.demo_image_processor = Compose(
-            [Resize((img_shape[1] + 8, img_shape[2] + 8), interpolation=bicubic, antialias=True)]
+            [
+                Resize((img_shape[1] + 8, img_shape[2] + 8), interpolation=bicubic, antialias=True),
+                CenterCrop((img_shape[1], img_shape[2])),
+            ]
         )
 
         self.last_obs = None

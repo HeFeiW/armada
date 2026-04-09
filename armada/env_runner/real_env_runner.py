@@ -433,6 +433,18 @@ class RealEnvRunner(BaseEnvRunner):
         if match_round:
             return int(match_round.group(1))
         return 0
+
+    def _validate_episode_shapes(self, episode: Dict[str, Any]):
+        """Validate one episode against replay buffer schema before appending."""
+        for key, value in episode.items():
+            if key not in self.replay_buffer.data:
+                continue
+            arr = self.replay_buffer.data[key]
+            if value.shape[1:] != arr.shape[1:]:
+                raise ValueError(
+                    f"Episode key '{key}' shape mismatch: "
+                    f"got tail={value.shape[1:]}, expected tail={arr.shape[1:]}, full={value.shape}"
+                )
     
     def _calculate_max_episode_length(self) -> int:
         """Calculate maximum episode length based on expert demonstrations"""
@@ -481,11 +493,13 @@ class RealEnvRunner(BaseEnvRunner):
                             if ep is None:
                                 print("[RUNNER] skipped discarded parallel episode")
                                 continue
+                            self._validate_episode_shapes(ep)
                             self.replay_buffer.add_episode(ep, compressors='disk')
                             self.saved_episode_idx = self.replay_buffer.n_episodes - 1
                             print(f'Saved episode {self.saved_episode_idx}')
                     else:
                         # Save episode to replay buffer
+                        self._validate_episode_shapes(episode_data)
                         self.replay_buffer.add_episode(episode_data, compressors='disk')
                         self.saved_episode_idx = self.replay_buffer.n_episodes - 1
                         print(f'Saved episode {self.saved_episode_idx}')

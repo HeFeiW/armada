@@ -34,16 +34,38 @@
 
 ## Interfaces
 
-1. Data collection output interface
-- episode keys: `wrist_cam`, `side_cam`, `tcp_pose`, `joint_pos`, `action`
+1. Data collection output interface  
+    - Each episode contains:
+      - `wrist_cam`: `(T, H, W, 3)`, `uint8`
+      - `side_cam`: `(T, H, W, 3)`, `uint8`
+      - `tcp_pose`: `(T, 7)`, `float32`
+      - `joint_pos`: `(T, 7)`, `float32`
+      - `action`: `(T, 8)`, `float32`
+    - Supported args in `collect_data.py`:
+      - `--output`
+      - `--num-envs`
+      - `--num-episodes`
+      - `--max-steps`
+      - `--no-zarr`
+      - `--seed`
+      - `--save-video`
+    - Example command:
+    ```bash
+    python maniskill_armada/collect_data.py --num-episodes 200 --save-video
+    ``` 
 
 2. Dataset interface
 - input: `.../replay_buffer.zarr`
 - output: `{'obs': {'wrist_img', 'side_img', 'ee_pose'}, 'action'}` as tensors
 
 3. Training interface
-- command: `python train.py train_maniskill_poc` (from `armada/`)
+- example command: `python armada/train.py train_maniskill_poc` 
 - config entry: Hydra config name `train_maniskill_poc`
+
+4. Check outputs:
+- checkpoints/logs under `armada/outputs/...`
+- dataset at `armada_data/maniskill_pick/replay_buffer.zarr`
+
 
 ## Key Compatibility Decisions
 

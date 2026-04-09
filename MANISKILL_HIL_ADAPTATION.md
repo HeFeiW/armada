@@ -13,7 +13,7 @@ Replace real-world robot human-in-loop path with a ManiSkill-native flow while k
   - `hardware/maniskill_robot_env.py`
 - Human-in-loop decision module:
   - `armada/utils/maniskill_hil.py`
-- Offline rollout renderer:
+- Offline rollout renderer
   - `maniskill_armada/render_rollout_videos.py`
 - Debug guide:
   - `MANISKILL_HIL_DEBUG_GUIDE.md`
@@ -23,17 +23,21 @@ Replace real-world robot human-in-loop path with a ManiSkill-native flow while k
   - Use `armada/config/maniskill_rollout.yaml`.
    - Set valid paths for `checkpoint_path`, `train_dataset_path`, `save_buffer_path`, `output_dir`.
 
-2. Run single-env rollout (recommended first check):
-   - Command:
-  - `python armada/run_rollout.py --config-name maniskill_rollout maniskill.num_envs=1`
+2. Command:
+  ```python
+  # run single-env rollout:
+  python armada/run_rollout.py --config-name maniskill_rollout maniskill.num_envs=1
+  # run parallel multi-env rollout(recommended for data collection):
+  python armada/run_rollout.py --config-name maniskill_rollout maniskill.num_envs=4
+  ```
 
-3. Run parallel multi-env rollout:
-   - Command:
-  - `python armada/run_rollout.py --config-name maniskill_rollout maniskill.num_envs=4`
-
-4. Output check:
+3. Output check:
    - Collected trajectories are saved to `save_buffer_path/replay_buffer.zarr`.
    - Visualization/scene artifacts are saved under `output_dir/seed_<seed>/`.
+   - run offline renderer to visualize saved trajectories:
+   ```python
+   python maniskill_armada/render_rollout_videos.py --buffer_path /path/to/replay_buffer.zarr --output_dir /path/to/video_output
+   ```
 
 ## Human-Loop Configuration
 Human-in-loop behavior is configured in `armada/config/maniskill_rollout.yaml` under `human_loop`.
@@ -43,10 +47,10 @@ Human-in-loop behavior is configured in `armada/config/maniskill_rollout.yaml` u
   - `manual`: terminal prompt per intervention event.
 - `on_failure`
   - default action when failure is reported.
-  - suggested value: `teleop`.
+  - suggested value: `teleop`, other options: `continue`, `discard`, `finish`.
 - `on_timeout`
   - default action when env truncates or max step is reached.
-  - suggested value: `teleop`.
+  - suggested value: `teleop`, other options: `continue`, `discard`, `finish`.
 - `prompt_timeout_s`
   - manual mode input timeout; fallback to configured default action.
 - `max_teleop_steps`
