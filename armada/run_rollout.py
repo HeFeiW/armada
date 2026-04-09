@@ -2,11 +2,14 @@ import pathlib
 import sys
 import os
 import socket
+import contextlib
 import torch
 import hydra
 from omegaconf import DictConfig
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "diffusion_policy"))
+
+from utils.maniskill_dashboard import SimpleConsoleRolloutUI
 
 
 def setup_distributed_env(port_start=29999):
@@ -31,11 +34,14 @@ def setup_distributed_env(port_start=29999):
 
 def main_worker(rank: int, cfg: DictConfig, device_ids: list):
     """Main worker function for each process"""
+    ui = SimpleConsoleRolloutUI(max_messages=12)
     try:
-        # Create and run the env runner
-        cls = hydra.utils.get_class(cfg._target_)
-        runner = cls(cfg, rank, device_ids)
-        runner.run_rollout()
+        with contextlib.redirect_stdout(ui), contextlib.redirect_stderr(ui):
+            # Create and run the env runner
+            cls = hydra.utils.get_class(cfg._target_)
+            runner = cls(cfg, rank, device_ids)
+            runner.console_ui = ui
+            runner.run_rollout()
     except Exception as e:
         print(f"Error in worker {rank}: {e}")
         raise

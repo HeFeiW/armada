@@ -17,7 +17,7 @@ from armada.diffusion_policy.diffusion_policy.common.pytorch_util import dict_ap
 from armada.diffusion_policy.diffusion_policy.model.common.rotation_transformer import RotationTransformer
 from hardware.my_device.macros import CAM_SERIAL, HUMAN, ROBOT
 from armada.utils.episode_manager import EpisodeManager
-from armada.utils.maniskill_dashboard import ManiSkillRolloutDashboard
+from armada.utils.maniskill_dashboard import ManiSkillRolloutDashboard, SimpleConsoleRolloutUI
 from armada.utils.maniskill_hil import ManiSkillHumanInLoopController
 from armada.env_runner.base_env_runner import BaseEnvRunner
 
@@ -42,6 +42,7 @@ class RealEnvRunner(BaseEnvRunner):
         self.sim_hil_controller = ManiSkillHumanInLoopController(
             dict(getattr(self.cfg, 'human_loop', {})) if self.is_sim else {}
         )
+        self.console_ui = None
         human_loop_cfg = getattr(self.cfg, 'human_loop', None)
         self.sim_dashboard = None
         if self.is_sim and human_loop_cfg is not None and bool(getattr(human_loop_cfg, 'visualize', True)):
@@ -168,9 +169,28 @@ class RealEnvRunner(BaseEnvRunner):
             num_samples=num_samples
         )
 
+    def _ui(self) -> Optional[SimpleConsoleRolloutUI]:
+        return getattr(self, 'console_ui', None)
+
+    def _ui_set_episode(self, episode_idx: int):
+        ui = self._ui()
+        if ui is not None:
+            ui.set_episode(episode_idx)
+
+    def _ui_update_env(self, env_idx: int, step: int, state: str, decision: str, mode: str = "", round_idx: Optional[int] = None):
+        ui = self._ui()
+        if ui is not None:
+            ui.update_env(env_idx, step=step, state=state, decision=decision, mode=mode, round_idx=round_idx)
+
+    def _ui_message(self, text: str, level: str = "info"):
+        ui = self._ui()
+        if ui is not None:
+            ui.push_message(text, level=level)
+
     def _run_parallel_sim_episode(self) -> List[Optional[Dict[str, Any]]]:
         """Run one vectorized ManiSkill episode with per-env human-in-loop decisions."""
         print(f"Running parallel simulation episode with num_envs={self.num_envs}")
+        self._ui_set_episode(self.episode_idx)
 
         self.robot_env.reset_robot(getattr(self.cfg, 'random_init', False), None)
         managers = [self._build_episode_manager(num_samples=1) for _ in range(self.num_envs)]
@@ -204,6 +224,7 @@ class RealEnvRunner(BaseEnvRunner):
                     state['tcp_pose'] if self.state_type == 'ee_pose' else state['joint_pos']
                 )
             managers[env_idx].initialize_pose(state['tcp_pose'][:3], state['tcp_pose'][3:])
+            self._ui_update_env(env_idx, int(steps[env_idx]), 'rollout', 'policy', mode='policy')
 
         while not np.all(env_finished):
             active_envs = [
@@ -310,15 +331,19 @@ class RealEnvRunner(BaseEnvRunner):
                         int(steps[env_idx]),
                         key_provider=(self.sim_dashboard.wait_for_key if self.sim_dashboard is not None else None),
                     )
+                    self._ui_update_env(env_idx, int(steps[env_idx]), 'waiting for decision', decision.action, mode='decision')
                     if decision.action == 'continue':
                         env_teleop[env_idx] = False
+                        self._ui_update_env(env_idx, int(steps[env_idx]), 'rollout', 'continue', mode='policy')
                         continue
                     if decision.action == 'discard':
                         env_discard[env_idx] = True
                         env_finished[env_idx] = True
+                        self._ui_update_env(env_idx, int(steps[env_idx]), 'discarded', 'discard', mode='decision')
                         continue
                     if decision.action == 'finish':
                         env_finished[env_idx] = True
+                        self._ui_update_env(env_idx, int(steps[env_idx]), 'finished', 'finish', mode='decision')
                         continue
                     # Enter teleop and initialize per-env teleop pose tracking.
                     self.robot_env.keyboard.infer = False
@@ -328,6 +353,7 @@ class RealEnvRunner(BaseEnvRunner):
                     teleop_last_r[env_idx] = managers[env_idx].last_r[0]
                     teleop_steps[env_idx] = 0
                     env_teleop[env_idx] = True
+                    self._ui_update_env(env_idx, int(steps[env_idx]), 'on decision', 'teleop', mode='teleop')
 
             # Progress teleop envs while others continue policy rollout.
             for env_idx in np.where(env_teleop)[0].tolist():
@@ -351,6 +377,7 @@ class RealEnvRunner(BaseEnvRunner):
                     )
                     managers[env_idx].initialize_pose(new_last_p, new_last_r.as_quat(scalar_first=True))
                     steps[env_idx] += 1
+                    self._ui_update_env(env_idx, int(steps[env_idx]), 'on decision', 'teleop', mode='teleop')
                 elif self.robot_env.keyboard.quit:
                     env_finished[:] = True
                     break
@@ -359,6 +386,7 @@ class RealEnvRunner(BaseEnvRunner):
                     env_teleop[env_idx] = False
                     teleop_steps[env_idx] = 0
                     self.sim_hil_controller.clear_blocked(env_idx)
+                    self._ui_update_env(env_idx, int(steps[env_idx]), 'rollout', 'continue', mode='policy')
                     continue
                 elif self.robot_env.keyboard.discard:
                     self.robot_env.keyboard.discard = False
@@ -367,6 +395,7 @@ class RealEnvRunner(BaseEnvRunner):
                     env_teleop[env_idx] = False
                     teleop_steps[env_idx] = 0
                     self.sim_hil_controller.clear_blocked(env_idx)
+                    self._ui_update_env(env_idx, int(steps[env_idx]), 'discarded', 'discard', mode='decision')
                     continue
                 elif self.robot_env.keyboard.finish:
                     self.robot_env.keyboard.finish = False
@@ -374,6 +403,7 @@ class RealEnvRunner(BaseEnvRunner):
                     env_teleop[env_idx] = False
                     teleop_steps[env_idx] = 0
                     self.sim_hil_controller.clear_blocked(env_idx)
+                    self._ui_update_env(env_idx, int(steps[env_idx]), 'finished', 'finish', mode='decision')
                     continue
 
                 teleop_steps[env_idx] += 1
@@ -554,6 +584,7 @@ class RealEnvRunner(BaseEnvRunner):
     
     def _run_single_episode(self) -> Optional[Dict[str, Any]]:
         """Run a single episode and return episode data"""
+        self._ui_set_episode(self.episode_idx)
         # Reset keyboard states
         self.robot_env.keyboard.finish = False
         self.robot_env.keyboard.help = False
@@ -579,6 +610,7 @@ class RealEnvRunner(BaseEnvRunner):
         
         robot_state = self.robot_env.reset_robot(getattr(self.cfg, 'random_init', False), random_init_pose)
         print(f"[RUNNER] episode={self.episode_idx} reset complete, initial j={self.j if hasattr(self, 'j') else 0}")
+        self._ui_update_env(0, 0, 'rollout', 'policy', mode='policy')
         
         # Initialize episode manager
         self.episode_manager.reset_observation_history()
@@ -626,6 +658,7 @@ class RealEnvRunner(BaseEnvRunner):
             if self.j >= self.max_episode_length:
                 print("Maximum episode length reached, turning to human for help.")
                 self.robot_env.keyboard.help = True
+                self._ui_update_env(0, int(self.j), 'waiting for decision', 'teleop', mode='decision')
             
             # Policy inference loop
             self._run_policy_inference_loop()
@@ -638,6 +671,7 @@ class RealEnvRunner(BaseEnvRunner):
             if self.robot_env.keyboard.quit:
                 print("[RUNNER] quit flag detected during human intervention, stopping episode")
                 self.robot_env.keyboard.finish = True
+                self._ui_update_env(0, int(self.j), 'finished', 'quit', mode='decision')
                 break
             
             # Check if episode should finish
@@ -808,6 +842,7 @@ class RealEnvRunner(BaseEnvRunner):
         """Run human intervention loop"""
         print("============ Human intervention =============")
         print(f"[RUNNER] intervention entry j={self.j} detach_pos={np.round(detach_pos, 4)}")
+        self._ui_update_env(0, int(self.j), 'waiting for decision', 'teleop', mode='decision')
         
         # Reset intervention signals to avoid stale state skipping teleop loop.
         self.robot_env.keyboard.help = False
@@ -830,6 +865,7 @@ class RealEnvRunner(BaseEnvRunner):
         self.robot_env.sigma.resume()
         self.robot_env.sigma.transform_from_robot(translate, rotation)
         print(f"[RUNNER] teleop transform translate={np.round(translate, 4)}")
+        self._ui_update_env(0, int(self.j), 'on decision', 'teleop', mode='teleop')
         
         # Human intervention loop
         while not (self.robot_env.keyboard.finish or self.robot_env.keyboard.discard or self.robot_env.keyboard.infer or self.robot_env.keyboard.quit):
@@ -871,6 +907,7 @@ class RealEnvRunner(BaseEnvRunner):
             
             self.j += 1
             print(f"[RUNNER] teleop step accepted, new j={self.j}")
+            self._ui_update_env(0, int(self.j), 'on decision', 'teleop', mode='teleop')
 
             if self.sim_dashboard is not None:
                 self.sim_dashboard.show(

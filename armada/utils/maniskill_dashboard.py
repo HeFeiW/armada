@@ -1,11 +1,138 @@
 from __future__ import annotations
 
 import os
+import sys
+import shutil
+import threading
+import time
 import textwrap
+from collections import deque
+from dataclasses import dataclass
 from typing import Dict, Optional, Sequence
 
 import cv2
 import numpy as np
+
+
+@dataclass
+class ConsoleMessage:
+    timestamp: float
+    level: str
+    text: str
+
+
+class SimpleConsoleRolloutUI:
+    """Minimal terminal UI for rollout status and message queue."""
+
+    def __init__(self, max_messages: int = 10):
+        self.max_messages = max_messages
+        self.episode_idx = 0
+        self.env_states: Dict[int, Dict[str, str]] = {}
+        self.messages = deque(maxlen=max_messages)
+        self._lock = threading.Lock()
+        self._buffer = ""
+        self._last_render = 0.0
+        self._render_interval_s = 0.05
+        self._terminal = sys.__stdout__
+
+    def set_episode(self, episode_idx: int):
+        with self._lock:
+            self.episode_idx = int(episode_idx)
+
+    def update_env(self, env_idx: int, *, step: int, state: str, decision: str, mode: str = "", round_idx: Optional[int] = None):
+        with self._lock:
+            payload = {
+                "step": str(int(step)),
+                "state": state,
+                "decision": decision,
+                "mode": mode,
+            }
+            if round_idx is not None:
+                payload["round"] = str(int(round_idx))
+            self.env_states[int(env_idx)] = payload
+        self.render()
+
+    def push_message(self, text: str, level: str = "info"):
+        cleaned = str(text).strip()
+        if not cleaned:
+            return
+        with self._lock:
+            self.messages.append(ConsoleMessage(time.time(), level, cleaned))
+        self.render()
+
+    def write(self, text: str):
+        if not text:
+            return 0
+        with self._lock:
+            self._buffer += text
+            lines = self._buffer.splitlines(keepends=True)
+            self._buffer = ""
+            for line in lines:
+                if line.endswith("\n") or line.endswith("\r"):
+                    cleaned = line.strip()
+                    if cleaned:
+                        self.messages.append(ConsoleMessage(time.time(), "info", cleaned))
+                else:
+                    self._buffer = line
+        self.render()
+        return len(text)
+
+    def flush(self):
+        with self._lock:
+            if self._buffer.strip():
+                self.messages.append(ConsoleMessage(time.time(), "info", self._buffer.strip()))
+                self._buffer = ""
+        self.render(force=True)
+
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        return self._terminal.fileno()
+
+    def _format_env_line(self, env_idx: int, state: Dict[str, str]) -> str:
+        return (
+            f"[{env_idx}] step={state.get('step', '-'):<4} "
+            f"state={state.get('state', '-'):<20} "
+            f"decision={state.get('decision', '-'):<10} "
+            f"mode={state.get('mode', '-'):<8}"
+        )
+
+    def render(self, force: bool = False):
+        now = time.time()
+        if not force and now - self._last_render < self._render_interval_s:
+            return
+        with self._lock:
+            self._last_render = now
+            width = shutil.get_terminal_size((120, 40)).columns
+            hr = "─" * max(20, width - 2)
+            lines = [
+                f" ARMADA ManiSkill Console UI ".center(width, "─"),
+                f" episode={self.episode_idx}  envs={len(self.env_states)}  messages={len(self.messages)} ",
+                hr,
+                " Environments ",
+            ]
+            if self.env_states:
+                for env_idx in sorted(self.env_states.keys()):
+                    lines.append("  " + self._format_env_line(env_idx, self.env_states[env_idx]))
+            else:
+                lines.append("  (no active environments)")
+            lines.extend([
+                hr,
+                " Messages ",
+            ])
+            if self.messages:
+                for msg in list(self.messages)[-self.max_messages :]:
+                    stamp = time.strftime("%H:%M:%S", time.localtime(msg.timestamp))
+                    prefix = {"error": "ERR", "warn": "WRN"}.get(msg.level, "INF")
+                    lines.append(f"  {stamp} {prefix} {msg.text}")
+            else:
+                lines.append("  (no messages)")
+            lines.append(hr)
+
+            self._terminal.write("\033[2J\033[H")
+            self._terminal.write("\n".join(lines) + "\n")
+            self._terminal.flush()
 
 
 class ManiSkillRolloutDashboard:
@@ -32,7 +159,6 @@ class ManiSkillRolloutDashboard:
         self._display_available = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
         if self.enabled and not self._display_available:
             self.enabled = False
-            print("[DASHBOARD] GUI disabled: no DISPLAY/WAYLAND_DISPLAY found; running headless.")
 
     def _ensure_window(self):
         if not self.enabled or self._window_ready:
@@ -40,11 +166,10 @@ class ManiSkillRolloutDashboard:
         try:
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
             self._window_ready = True
-            print(f"[DASHBOARD] opened window: {self.window_name}")
         except Exception as exc:
             self.enabled = False
             self._window_ready = False
-            print(f"[DASHBOARD] GUI disabled due to OpenCV window error: {exc}")
+            _ = exc
 
     def _resize_rgb(self, image: np.ndarray) -> np.ndarray:
         if image is None:
@@ -105,16 +230,6 @@ class ManiSkillRolloutDashboard:
     ):
         if not self.enabled:
             return
-
-        if banner:
-            print(f"[DASHBOARD] {banner}")
-        for env_idx, status in sorted(env_status.items()):
-            print(
-                f"[DASHBOARD] env={env_idx} step={status.get('step', '-') } mode={status.get('mode', '-') } "
-                f"state={status.get('state', '-') } decision={status.get('decision', '-') }",
-            )
-        if error_text:
-            print(f"[DASHBOARD] error={str(error_text).splitlines()[0][:200]}")
 
         self._ensure_window()
         env_panels = []
@@ -186,9 +301,6 @@ class ManiSkillRolloutDashboard:
         if not self.enabled:
             return
 
-        print(f"[DASHBOARD] error screen: {banner}")
-        print(error_text)
-
         self._ensure_window()
         canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 72), (0, 0, 120), -1)
@@ -202,4 +314,3 @@ class ManiSkillRolloutDashboard:
         if self.enabled and self._window_ready:
             cv2.destroyWindow(self.window_name)
             self._window_ready = False
-            print(f"[DASHBOARD] closed window: {self.window_name}")
