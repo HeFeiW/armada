@@ -34,6 +34,7 @@ class FLOAT(AsyncFailureDetectionModule):
                  save_buffer_path: str = None,
                  output_dir: str = None,
                  enable_visualization: bool = False,
+                 debug_ot_per_step: bool = False,
                  To: int = 2,
                  ee_pose_dim: List[int] = None,
                  image_shape: List[int] = None
@@ -55,6 +56,7 @@ class FLOAT(AsyncFailureDetectionModule):
         self.ot_percentile: float = ot_percentile
         self.soft_ot_ratio: float = soft_ot_ratio
         self.update_stats: bool = update_stats
+        self.debug_ot_per_step: bool = debug_ot_per_step
         self.Ta: int = Ta
         self.train_dataset_path: str = train_dataset_path
         self.save_buffer_path: str = save_buffer_path
@@ -324,6 +326,19 @@ class FLOAT(AsyncFailureDetectionModule):
                 self.greedy_ot_plan = result["greedy_ot_plan"]
                 self.greedy_ot_cost = result["greedy_ot_cost"]
 
+                if self.debug_ot_per_step and result["idx"] >= 0:
+                    step_ot = float(self.greedy_ot_cost[result["idx"]].item())
+                    cum_ot = float(torch.sum(self.greedy_ot_cost[:result["idx"] + 1]).item())
+                    threshold = (
+                        "None"
+                        if self.expert_ot_threshold is None
+                        else f"{float(self.expert_ot_threshold):.6f}"
+                    )
+                    print(
+                        f"[FLOAT][OT_DEBUG] idx={result['idx']} "
+                        f"step_ot={step_ot:.6f} cum_ot={cum_ot:.6f} threshold={threshold}"
+                    )
+
                 if self.ot_visualizer is not None and result["idx"] >= 0:
                     current_ot_cost = self.greedy_ot_cost[result["idx"]].item()
                     cumulative_ot_cost = torch.sum(self.greedy_ot_cost[:result["idx"] + 1]).item()
@@ -592,10 +607,11 @@ class FLOAT(AsyncFailureDetectionModule):
         self.human_eps_len = []
 
         from torchvision.transforms import CenterCrop
+        side_img_processor = CenterCrop((self.img_shape[1], self.img_shape[2]))
+        wrist_img_processor = CenterCrop((self.img_shape[1], self.img_shape[2]))
+        latent_batch_size = 64
         for i in tqdm.tqdm(self.human_demo_indices, desc="Obtaining latent for human demo"):
             human_episode = self.replay_buffer.get_episode(i)
-            side_img_processor = CenterCrop((self.img_shape[1], self.img_shape[2]))
-            wrist_img_processor = CenterCrop((self.img_shape[1], self.img_shape[2]))
 
             eps_side_img = (side_img_processor(torch.from_numpy(human_episode['side_cam']).permute(0, 3, 1, 2)) / 255.0).to(self.device)
             eps_wrist_img = (wrist_img_processor(torch.from_numpy(human_episode['wrist_cam']).permute(0, 3, 1, 2)) / 255.0).to(self.device)
@@ -613,26 +629,38 @@ class FLOAT(AsyncFailureDetectionModule):
             eps_state = torch.from_numpy(eps_state).to(self.device)
             demo_len = human_episode['action'].shape[0]
 
-            human_latent = torch.zeros((self.max_episode_length // self.Ta, int(self.To * self.obs_feature_dim)), device=self.device)
-            for idx in range(self.max_episode_length // self.Ta):
-                human_demo_idx = min(idx * self.Ta, (demo_len // self.Ta - 1) * self.Ta)
-                if human_demo_idx < self.To - 1:
-                    indices = [0] * (self.To - 1 - human_demo_idx) + list(range(human_demo_idx + 1))
-                    obs_dict = {
-                        'side_img': eps_side_img[indices, :].unsqueeze(0),
-                        'wrist_img': eps_wrist_img[indices, :].unsqueeze(0),
-                        self.episode_manager.state_type: eps_state[indices, :].unsqueeze(0)
-                    }
-                else:
-                    obs_dict = {
-                        'side_img': eps_side_img[human_demo_idx - self.To + 1: human_demo_idx + 1, :].unsqueeze(0),
-                        'wrist_img': eps_wrist_img[human_demo_idx - self.To + 1: human_demo_idx + 1, :].unsqueeze(0),
-                        self.episode_manager.state_type: eps_state[human_demo_idx - self.To + 1: human_demo_idx + 1, :].unsqueeze(0)
-                    }
+            episode_steps = self.max_episode_length // self.Ta
+            human_latent = torch.zeros((episode_steps, int(self.To * self.obs_feature_dim)), device=self.device)
 
-                with torch.no_grad():
+            # Build [episode_steps, To] indices once, then run latent extraction in mini-batches.
+            last_demo_idx = max((demo_len // self.Ta - 1) * self.Ta, 0)
+            window_indices = torch.zeros((episode_steps, self.To), dtype=torch.long, device=self.device)
+            for idx in range(episode_steps):
+                human_demo_idx = min(idx * self.Ta, last_demo_idx)
+                if human_demo_idx < self.To - 1:
+                    valid = torch.arange(human_demo_idx + 1, device=self.device)
+                    window_indices[idx, self.To - valid.shape[0]:] = valid
+                else:
+                    window_indices[idx] = torch.arange(
+                        human_demo_idx - self.To + 1,
+                        human_demo_idx + 1,
+                        device=self.device
+                    )
+
+            side_windows = eps_side_img[window_indices]
+            wrist_windows = eps_wrist_img[window_indices]
+            state_windows = eps_state[window_indices]
+
+            with torch.no_grad():
+                for start in range(0, episode_steps, latent_batch_size):
+                    end = min(start + latent_batch_size, episode_steps)
+                    obs_dict = {
+                        'side_img': side_windows[start:end],
+                        'wrist_img': wrist_windows[start:end],
+                        self.episode_manager.state_type: state_windows[start:end]
+                    }
                     obs_features = self.policy.extract_latent(obs_dict)
-                    human_latent[idx] = obs_features.squeeze(0).reshape(-1)
+                    human_latent[start:end] = obs_features.reshape(end - start, -1)
 
             self.human_eps_len.append(self.max_episode_length)
             self.all_human_latent.append(human_latent)
