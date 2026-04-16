@@ -36,7 +36,7 @@ Replace real-world robot human-in-loop path with a ManiSkill-native flow while k
    - Visualization/scene artifacts are saved under `output_dir/seed_<seed>/`.
    - run offline renderer to visualize saved trajectories:
    ```python
-   python maniskill_armada/render_rollout_videos.py --buffer_path /path/to/replay_buffer.zarr --output_dir /path/to/video_output
+    python maniskill_armada/render_rollout_videos.py --replay-buffer /path/to/replay_buffer.zarr --output-dir /path/to/video_output
    ```
 
 ## Human-Loop Configuration

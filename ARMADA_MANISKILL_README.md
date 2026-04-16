@@ -18,6 +18,15 @@ This document summarizes the current state of ManiSkill integration in ARMADA, f
 ```bash
 python maniskill_armada/collect_data.py --output /path/to/output_dir
 ```
+- For a minimal validation dataset with fixed reset condition (and optional fixed lift target), run:
+```bash
+python maniskill_armada/collect_data.py \
+	--output /path/to/output_dir_fixed \
+	--num-episodes 100 \
+	--max-steps 200 \
+	--fixed-reset-seed 0
+# optional: add --fixed-goal-pos 0.55 0.00 0.20
+```
 - To train the policy, run:
 ```bash
 python armada/train.py train_maniskill_poc

@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from typing import Tuple
 from scipy.spatial.transform import Rotation as R
+from maniskill_armada.data_utils import extract_action_from_poses
 
 class EpisodeManager:
     def __init__(self, 
@@ -49,6 +50,16 @@ class EpisodeManager:
             
         self.last_p = p[np.newaxis, :].repeat(self.num_samples, axis=0)
         self.last_r = R.from_quat(r[np.newaxis, :].repeat(self.num_samples, axis=0), scalar_first=True)
+
+    @staticmethod
+    def _quat_wxyz_to_xyzw(quat_wxyz: np.ndarray) -> np.ndarray:
+        quat_wxyz = np.asarray(quat_wxyz, dtype=np.float32).reshape(4)
+        return np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float32)
+
+    @staticmethod
+    def _quat_xyzw_to_wxyz(quat_xyzw: np.ndarray) -> np.ndarray:
+        quat_xyzw = np.asarray(quat_xyzw, dtype=np.float32).reshape(4)
+        return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float32)
         
     def _preprocess_robot_state(self, state):
         """Preprocess robot state based on proprioceptive type"""
@@ -82,6 +93,8 @@ class EpisodeManager:
     
     def get_absolute_action_for_step(self, action_seq, step):
         """Get absolute action for a specific step in the action chunk, used for deployment"""
+        prev_p = self.last_p.copy()
+        prev_r = self.last_r
         curr_p_action = action_seq[:, step, :3]
         curr_p = self.last_p + curr_p_action
         
@@ -90,6 +103,27 @@ class EpisodeManager:
         curr_r = self.last_r * action_rot
         
         gripper_action = action_seq[:, step, -1]
+
+        converted_dp = np.zeros_like(curr_p, dtype=np.float32)
+        converted_dq = np.zeros((self.num_samples, 4), dtype=np.float32)
+        for i in range(self.num_samples):
+            prev_pose_xyzw = np.concatenate(
+                [prev_p[i], self._quat_wxyz_to_xyzw(prev_r[i].as_quat(scalar_first=True))], axis=0
+            )
+            curr_pose_xyzw = np.concatenate(
+                [curr_p[i], self._quat_wxyz_to_xyzw(curr_r[i].as_quat(scalar_first=True))], axis=0
+            )
+            pose_delta_xyzw = extract_action_from_poses(
+                prev_pose_xyzw,
+                curr_pose_xyzw,
+                float(gripper_action[i]),
+                float(gripper_action[i]),
+            )
+            converted_dp[i] = pose_delta_xyzw[:3].astype(np.float32)
+            converted_dq[i] = self._quat_xyzw_to_wxyz(pose_delta_xyzw[3:7])
+
+        curr_p_action = converted_dp
+        curr_r_action = converted_dq
     
         self.last_p = curr_p
         self.last_r = curr_r

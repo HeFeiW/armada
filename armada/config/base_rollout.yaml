@@ -12,12 +12,14 @@ maniskill:
   obs_mode: rgbd
   control_mode: pd_ee_delta_pose
   render_mode: rgb_array
+  max_episode_steps: 300
   seed: ${seed}
   side_camera_name: base_camera
   wrist_camera_name: base_camera
   max_snapshot_steps: 5000
   auto_intervention_steps: ${Ta}
   gripper_max_width: 0.09
+  teleop_feedback_from_measured_pose: true
 
 human_loop:
   # mode: auto | manual
@@ -37,6 +39,7 @@ output_dir: /path/to/output/visualization
 Ta: 8
 random_init: True
 seed: 31
+debug_policy_freeze_rotation: false
 
 # Failure detection configuration
 failure_detection:

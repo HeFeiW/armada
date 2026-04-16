@@ -32,6 +32,11 @@ class HeuristicPickPolicy:
         self.max_rot_delta = float(self.config.get('max_rot_delta', 0.6))
         self.approach_tolerance = float(self.config.get('approach_tolerance', 0.015))
         self.grasp_height_offset = float(self.config.get('grasp_height_offset', 0.00))
+        self.fixed_goal_pos = self.config.get('fixed_goal_pos', None)
+        if self.fixed_goal_pos is not None:
+            self.fixed_goal_pos = np.asarray(self.fixed_goal_pos, dtype=np.float32).reshape(-1)
+            if self.fixed_goal_pos.shape[0] != 3:
+                raise ValueError(f"fixed_goal_pos must have shape (3,), got {self.fixed_goal_pos.shape}")
 
         # State tracking
         self.prev_tcp_pose = None
@@ -125,7 +130,13 @@ class HeuristicPickPolicy:
         cube_pose = self._extract_obj_pose(obs, obj_pose=obj_pose)
         cube_pos = cube_pose[:3]
         cube_quat = cube_pose[3:7]
-        goal_pos = np.asarray(extra_obs.get('goal_pos', cube_pos + np.array([0.0, 0.0, 0.1], dtype=np.float32)), dtype=np.float32).reshape(-1)
+        if self.fixed_goal_pos is not None:
+            goal_pos = self.fixed_goal_pos
+        else:
+            goal_pos = np.asarray(
+                extra_obs.get('goal_pos', cube_pos + np.array([0.0, 0.0, 0.1], dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(-1)
 
 
         grasp_pose = cube_pos.copy()

@@ -116,7 +116,8 @@ def render_episode_to_video(
     try:
         for t in range(episode["action"].shape[0]):
             frame = _make_episode_frame(episode, t, show_actions=show_actions, panel_size=panel_size)
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            # _make_episode_frame already returns a BGR frame for OpenCV writer.
+            writer.write(frame)
     finally:
         writer.release()
 

@@ -13,6 +13,7 @@ import torch
 from PIL import Image
 from scipy.spatial.transform import Rotation as R
 from torchvision.transforms import CenterCrop, Compose, InterpolationMode, Resize
+from maniskill_armada.data_utils import extract_action_from_poses
 
 from hardware.my_device.macros import INTV
 
@@ -51,6 +52,7 @@ class ManiSkillRobotEnv:
         self.obs_mode = cfg.get("obs_mode", "state_dict")
         self.control_mode = cfg.get("control_mode", "pd_ee_delta_pose")
         self.render_mode = cfg.get("render_mode", "rgb_array")
+        self.max_episode_steps = int(cfg.get("max_episode_steps", 300))
         self.seed = int(cfg.get("seed", 0))
         self.side_camera_name = cfg.get("side_camera_name", "base_camera")
         self.wrist_camera_name = cfg.get("wrist_camera_name", "base_camera")
@@ -60,10 +62,20 @@ class ManiSkillRobotEnv:
         self.teleop_pos_step = float(cfg.get("teleop_pos_step", 0.01))
         self.teleop_rot_step_deg = float(cfg.get("teleop_rot_step_deg", 6.0))
         self.teleop_gripper_step = float(cfg.get("teleop_gripper_step", 0.01))
+        self.teleop_rotation_world_frame = bool(cfg.get("teleop_rotation_world_frame", True))
+        self.teleop_feedback_from_measured_pose = bool(cfg.get("teleop_feedback_from_measured_pose", True))
         self.teleop_show_help = bool(cfg.get("teleop_show_help", True))
         self.teleop_use_cv2_keys = bool(cfg.get("teleop_use_cv2_keys", True))
         self.teleop_terminal_poll_timeout_s = float(cfg.get("teleop_terminal_poll_timeout_s", 0.2))
         self.teleop_no_input_log_interval_s = float(cfg.get("teleop_no_input_log_interval_s", 2.0))
+        self.debug_camera_enable = bool(cfg.get("debug_camera_enable", False))
+        self.debug_side_camera_offset = np.asarray(
+            cfg.get("debug_side_camera_offset", [0.0, 0.0, 0.0]), dtype=np.float32
+        ).reshape(3)
+        self.debug_wrist_camera_offset = np.asarray(
+            cfg.get("debug_wrist_camera_offset", [0.0, 0.0, 0.0]), dtype=np.float32
+        ).reshape(3)
+        self._debug_camera_applied = False
         self._has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
         self.env = gym.make(
@@ -72,6 +84,7 @@ class ManiSkillRobotEnv:
             obs_mode=self.obs_mode,
             control_mode=self.control_mode,
             render_mode=self.render_mode,
+            max_episode_steps=self.max_episode_steps,
         )
         self.single_action_space = getattr(self.env, "single_action_space", self.env.action_space)
 
@@ -126,10 +139,84 @@ class ManiSkillRobotEnv:
         self._stdin_unavailable_warned = False
         self._last_no_input_log_time = 0.0
 
+    def _try_apply_sensor_pose_offset(self, sensor_obj: Any, offset: np.ndarray) -> bool:
+        if sensor_obj is None:
+            return False
+
+        pose_owner = sensor_obj
+        pose = getattr(sensor_obj, "pose", None)
+        if pose is None and hasattr(sensor_obj, "camera"):
+            pose_owner = getattr(sensor_obj, "camera")
+            pose = getattr(pose_owner, "pose", None)
+        if pose is None:
+            return False
+
+        try:
+            pos = np.asarray(getattr(pose, "p"), dtype=np.float32)
+            quat = np.asarray(getattr(pose, "q"), dtype=np.float32)
+            if pos.ndim == 1:
+                pos_new = pos + offset
+            else:
+                pos_new = pos + offset.reshape(1, 3)
+
+            pose_cls = type(pose)
+            new_pose = None
+            if hasattr(pose_cls, "create_from_pq"):
+                new_pose = pose_cls.create_from_pq(pos_new, quat)
+            else:
+                try:
+                    new_pose = pose_cls(pos_new, quat)
+                except Exception:
+                    return False
+
+            if hasattr(pose_owner, "set_pose"):
+                pose_owner.set_pose(new_pose)
+                return True
+            if hasattr(pose_owner, "pose"):
+                pose_owner.pose = new_pose
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _apply_debug_camera_offsets_once(self):
+        if not self.debug_camera_enable or self._debug_camera_applied:
+            return
+
+        sensors = getattr(self.env.unwrapped, "_sensors", None)
+        if not isinstance(sensors, dict):
+            sensors = getattr(self.env.unwrapped, "sensors", None)
+        if not isinstance(sensors, dict):
+            print("[SIM TELEOP] Debug camera offset requested but sensor dictionary was not found.")
+            return
+
+        side_ok = self._try_apply_sensor_pose_offset(sensors.get(self.side_camera_name), self.debug_side_camera_offset)
+        wrist_ok = self._try_apply_sensor_pose_offset(sensors.get(self.wrist_camera_name), self.debug_wrist_camera_offset)
+        self._debug_camera_applied = side_ok or wrist_ok
+        if self._debug_camera_applied:
+            print(
+                f"[SIM TELEOP] Applied debug camera offsets: side={self.debug_side_camera_offset.tolist()}, "
+                f"wrist={self.debug_wrist_camera_offset.tolist()}"
+            )
+        else:
+            print("[SIM TELEOP] Debug camera offsets could not be applied on current ManiSkill sensor objects.")
+
     def _to_numpy(self, value):
         if isinstance(value, torch.Tensor):
             return value.detach().cpu().numpy()
         return np.asarray(value)
+
+    def _quat_wxyz_to_xyzw(self, quat_wxyz: np.ndarray) -> np.ndarray:
+        quat_wxyz = np.asarray(quat_wxyz, dtype=np.float32).reshape(4)
+        return np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float32)
+
+    def _quat_xyzw_to_wxyz(self, quat_xyzw: np.ndarray) -> np.ndarray:
+        quat_xyzw = np.asarray(quat_xyzw, dtype=np.float32).reshape(4)
+        return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float32)
+
+    def _pose_wxyz_to_xyzw(self, pose_wxyz: np.ndarray) -> np.ndarray:
+        pose_wxyz = np.asarray(pose_wxyz, dtype=np.float32).reshape(7)
+        return np.concatenate([pose_wxyz[:3], self._quat_wxyz_to_xyzw(pose_wxyz[3:7])], axis=0)
 
     def _clone_state_dict(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         def _clone(v):
@@ -248,6 +335,7 @@ class ManiSkillRobotEnv:
 
         self._snapshots = []
         self._capture_snapshot()
+        self._apply_debug_camera_offsets_once()
 
         # random_init_pose is accepted for API compatibility but not enforced in simulator.
         _ = random_init
@@ -279,7 +367,17 @@ class ManiSkillRobotEnv:
         demo_wrist_img = self.demo_image_processor(
             torch.from_numpy(wrist_rgb.copy()).permute(2, 0, 1)
         )
-
+        # debug: show teleop camera images in OpenCV windows
+        if self.debug_camera_enable and not self._has_display:
+            # save the processed policy images to disk for inspection
+            Image.fromarray(policy_side_img.permute(1, 2, 0).numpy()).save("debug_policy_side.png")
+            Image.fromarray(policy_wrist_img.permute(1, 2, 0).numpy()).save("debug_policy_wrist.png")
+            print('image saved')
+        if self.debug_camera_enable and self._has_display:
+            cv2.imshow("Debug Side Camera", side_rgb)
+            cv2.imshow("Debug Wrist Camera", wrist_rgb)
+            cv2.waitKey(1)
+            
         return {
             "tcp_pose": tcp_pose,
             "joint_pos": joint_pos,
@@ -300,15 +398,16 @@ class ManiSkillRobotEnv:
         if curr_pose is None:
             curr_pose = self.last_tcp_pose if self.last_tcp_pose is not None else tcp_action.copy()
 
-        curr_p = curr_pose[:3]
-        curr_q = curr_pose[3:]
-        tgt_p = np.asarray(tcp_action[:3], dtype=np.float32)
-        tgt_q = np.asarray(tcp_action[3:7], dtype=np.float32)
-
-        dp = tgt_p - curr_p
-        curr_r = R.from_quat(curr_q, scalar_first=True)
-        tgt_r = R.from_quat(tgt_q, scalar_first=True)
-        dr = (curr_r.inv() * tgt_r).as_rotvec().astype(np.float32)
+        curr_pose = np.asarray(curr_pose, dtype=np.float32).reshape(7)
+        tgt_pose = np.asarray(tcp_action, dtype=np.float32).reshape(7)
+        pose_delta_xyzw = extract_action_from_poses(
+            self._pose_wxyz_to_xyzw(curr_pose),
+            self._pose_wxyz_to_xyzw(tgt_pose),
+            float(self.last_gripper_width),
+            float(gripper_action),
+        )
+        dp = pose_delta_xyzw[:3].astype(np.float32)
+        dr = R.from_quat(pose_delta_xyzw[3:7]).as_rotvec().astype(np.float32)
 
         if self.gripper_max_width > 1e-6:
             g = float(np.clip((2.0 * (gripper_action / self.gripper_max_width)) - 1.0, -1.0, 1.0))
@@ -436,6 +535,7 @@ class ManiSkillRobotEnv:
             "  Translation: W/S (+/-X), A/Z (+/-Y), R/V (+/-Z)\n"
             "  Rotation:    U/J (+/-Roll), I/K (+/-Pitch), O/L (+/-Yaw)\n"
             "  Gripper:     N (close), M (open)\n"
+            f"  Rotation frame: {'world' if self.teleop_rotation_world_frame else 'tcp-local'}\n"
             f"  Control:     C (return to policy), F (finish), D (discard), Q (quit){input_suffix}",
             flush=True,
         )
@@ -447,10 +547,11 @@ class ManiSkillRobotEnv:
         self._print_teleop_help_once()
 
         key = self._poll_keyboard_key()
+        prev_p = np.asarray(last_p, dtype=np.float32).copy()
+        prev_q_wxyz = last_r.as_quat(scalar_first=True).astype(np.float32)
         dp = np.zeros(3, dtype=np.float32)
         d_rotvec = np.zeros(3, dtype=np.float32)
         gripper_action = float(self.last_gripper_width)
-        print(f'[SIM TELEOP] Step {self._teleop_steps}, key: {key}, dp: {dp}, d_rotvec: {d_rotvec}, gripper_action: {gripper_action}')
         if key == "q":
             self.keyboard.quit = True
         elif key == "f":
@@ -488,21 +589,32 @@ class ManiSkillRobotEnv:
         elif key == "m":
             gripper_action = float(np.clip(self.last_gripper_width + self.teleop_gripper_step, 0.0, self.gripper_max_width))
 
-        curr_p_action = dp
-        if np.linalg.norm(d_rotvec) > 0:
-            curr_r_action = R.from_rotvec(d_rotvec.astype(np.float64)).as_quat(scalar_first=True).astype(np.float32)
-        else:
-            curr_r_action = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-
         target_p = np.asarray(last_p, dtype=np.float32) + dp
-        target_r = last_r * R.from_rotvec(d_rotvec.astype(np.float64))
+        delta_r = R.from_rotvec(d_rotvec.astype(np.float64))
+        if self.teleop_rotation_world_frame:
+            # Apply increments in world axes so keys map to world-frame orientation updates.
+            target_r = delta_r * last_r
+        else:
+            # Optional fallback to TCP-local increment behavior.
+            target_r = last_r * delta_r
 
         control_signal_set = self.keyboard.infer or self.keyboard.finish or self.keyboard.discard or self.keyboard.quit
         has_motion = (np.linalg.norm(dp) > 0) or (np.linalg.norm(d_rotvec) > 0)
         has_gripper_update = abs(gripper_action - float(self.last_gripper_width)) > 1e-8
-
+        curr_p_action = np.zeros(3, dtype=np.float32)
+        curr_r_action = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         if has_motion or has_gripper_update:
             target_pose = np.concatenate((target_p, target_r.as_quat(scalar_first=True).astype(np.float32)), axis=0)
+            target_pose_xyzw = self._pose_wxyz_to_xyzw(target_pose)
+            prev_pose_xyzw = np.concatenate((prev_p, self._quat_wxyz_to_xyzw(prev_q_wxyz)), axis=0)
+            teleop_delta_xyzw = extract_action_from_poses(
+                prev_pose_xyzw,
+                target_pose_xyzw,
+                float(self.last_gripper_width),
+                float(gripper_action),
+            )
+            curr_p_action = teleop_delta_xyzw[:3].astype(np.float32)
+            curr_r_action = self._quat_xyzw_to_wxyz(teleop_delta_xyzw[3:7])
             self.deploy_action(target_pose, gripper_action)
             last_p = target_p
             last_r = target_r
@@ -514,11 +626,19 @@ class ManiSkillRobotEnv:
         tcp_pose = state_data["tcp_pose"]
         joint_pos = state_data["joint_pos"]
 
+        # Use measured simulator pose as teleop feedback state to avoid accumulating
+        # unreachable command targets, which often manifests as jitter.
+        if self.teleop_feedback_from_measured_pose:
+            last_p = np.asarray(tcp_pose[:3], dtype=np.float32)
+            last_r = R.from_quat(np.asarray(tcp_pose[3:], dtype=np.float32), scalar_first=True)
+
         processed_data = {
             "policy_wrist_img": state_data["policy_wrist_img"],
             "policy_side_img": state_data["policy_side_img"],
             "demo_wrist_img": state_data["demo_wrist_img"],
             "demo_side_img": state_data["demo_side_img"],
+            "wrist_img_raw": state_data["wrist_img_raw"],
+            "side_img_raw": state_data["side_img_raw"],
             "tcp_pose": tcp_pose,
             "joint_pos": joint_pos,
             "action": np.concatenate((curr_p_action, curr_r_action, [gripper_action])),

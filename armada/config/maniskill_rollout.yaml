@@ -10,7 +10,8 @@ env_backend: maniskill
 device_ids: '0'
 
 # Model / data paths
-checkpoint_path: /home/tmp_wanghf/armada/outputs/2026.04.04/20.14.11_train_diffusion_transformer_hybrid_dino_multi_gpu_maniskill_pick/checkpoints/latest.ckpt
+
+checkpoint_path: /home/tmp_wanghf/armada/outputs/2026.04.04/21.22.42_train_diffusion_transformer_hybrid_dino_multi_gpu_maniskill_pick/checkpoints/latest.ckpt
 train_dataset_path: /home/tmp_wanghf/armada/armada_data/maniskill_pick
 save_buffer_path: /home/tmp_wanghf/armada/armada_data/maniskill_pick_rollout_poc
 output_dir: /home/tmp_wanghf/armada/outputs_rollout/maniskill_poc
@@ -19,6 +20,7 @@ output_dir: /home/tmp_wanghf/armada/outputs_rollout/maniskill_poc
 Ta: 8
 random_init: True
 seed: 31
+debug_policy_freeze_rotation: false
 
 maniskill:
   env_id: PickCube-v1
@@ -26,6 +28,7 @@ maniskill:
   obs_mode: rgbd
   control_mode: pd_ee_delta_pose
   render_mode: rgb_array
+  max_episode_steps: 300
   seed: ${seed}
   side_camera_name: base_camera
   wrist_camera_name: base_camera
@@ -35,9 +38,19 @@ maniskill:
   teleop_pos_step: 0.01
   teleop_rot_step_deg: 6.0
   teleop_gripper_step: 0.01
+  teleop_rotation_world_frame: true
+  teleop_feedback_from_measured_pose: true
   teleop_show_help: true
   teleop_terminal_poll_timeout_s: 0.2
   teleop_no_input_log_interval_s: 2.0
+  # Keep disabled by default; set true for temporary teleop camera debugging.
+  debug_camera_enable: true
+  # Original camera setup is unchanged when offsets are [0, 0, 0].
+  # Suggested wide-view debug example (left/right + farther):
+  # debug_side_camera_offset: [0.0, -0.25, 0.20]
+  # debug_wrist_camera_offset: [0.0, 0.25, 0.20]
+  debug_side_camera_offset: [0.0, 0.0, 0.0]
+  debug_wrist_camera_offset: [0.0, 0.0, 0.0]
 
 # Human-in-loop for simulation
 human_loop:
@@ -60,6 +73,7 @@ failure_detection:
   ot_percentile: 95
   soft_ot_ratio: 0.2
   update_stats: False
+  debug_ot_per_step: true
   Ta: ${Ta}
   train_dataset_path: ${train_dataset_path}
   save_buffer_path: ${save_buffer_path}

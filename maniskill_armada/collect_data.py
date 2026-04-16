@@ -37,7 +37,13 @@ def get_env_obj_pose(env) -> np.ndarray:
     return None
 
 
-def collect_episode(env, policy, episode_idx: int, max_steps: int = 200) -> Dict:
+def collect_episode(
+    env,
+    policy,
+    episode_idx: int,
+    max_steps: int = 200,
+    reset_seed: Optional[int] = None,
+) -> Dict:
     """
     Collect one episode using heuristic policy.
 
@@ -50,7 +56,7 @@ def collect_episode(env, policy, episode_idx: int, max_steps: int = 200) -> Dict
     Returns:
         dict with episode data {wrist_cam, side_cam, tcp_pose, joint_pos, action}
     """
-    obs, info = env.reset()
+    obs, info = env.reset(seed=reset_seed)
     policy.reset()
 
     done = False
@@ -146,6 +152,20 @@ def main():
                         help='Skip zarr saving (debug mode)')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for environment')
     parser.add_argument('--save-video', action='store_true', help='Whether to save episode videos')
+    parser.add_argument(
+        '--fixed-reset-seed',
+        type=int,
+        default=None,
+        help='Use the same reset seed for every episode (minimal validation for fixed target/initial state).',
+    )
+    parser.add_argument(
+        '--fixed-goal-pos',
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=('X', 'Y', 'Z'),
+        help='Override heuristic lift target goal_pos with a fixed world position [x y z].',
+    )
     args = parser.parse_args()
 
     # Create output directory
@@ -187,7 +207,12 @@ def main():
     print(f"Environment created successfully")
 
     # Initialize heuristic policy
-    policy = HeuristicPickPolicy(env)
+    policy_cfg = {}
+    if args.fixed_goal_pos is not None:
+        policy_cfg['fixed_goal_pos'] = list(args.fixed_goal_pos)
+        print(f"Using fixed heuristic goal_pos: {policy_cfg['fixed_goal_pos']}")
+
+    policy = HeuristicPickPolicy(env, config=policy_cfg)
 
     total_episodes = 0
     total_steps = 0
@@ -199,7 +224,8 @@ def main():
     for ep_idx in range(args.num_episodes):
         print(f"\nEpisode {ep_idx + 1}/{args.num_episodes}...")
         try:
-            result = collect_episode(env, policy, ep_idx)
+            reset_seed = args.fixed_reset_seed
+            result = collect_episode(env, policy, ep_idx, max_steps=args.max_steps, reset_seed=reset_seed)
 
             if result is None:
                 print("FAILED (no data)")
