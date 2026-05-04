@@ -1,6 +1,6 @@
 name: maniskill_pick
 image_shape: [3, 224, 224]
-dataset_path: /home/tmp_wanghf/armada/armada_data/maniskill_pick
+dataset_path: /home/tmp_wanghf/armada/armada_data/maniskill_pick_fixed_goal_min
 
 shape_meta: &shape_meta
   obs:

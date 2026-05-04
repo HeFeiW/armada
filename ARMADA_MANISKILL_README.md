@@ -68,6 +68,10 @@ python armada/run_rollout.py --config-name maniskill_rollout maniskill.num_envs=
 	- `teleop_gripper_step`: gripper width step per keypress (meters)
 	- `teleop_show_help`: print one-time teleop key map when intervention starts
 	- `teleop_use_cv2_keys`: use OpenCV window key polling when display is available
+	- `teleop_input_mode`: `keyboard` or `heuristic`; heuristic mode drives teleop from a TCP target generator instead of key presses
+	- `teleop_heuristic.max_steps`: maximum heuristic teleop steps before returning control
+
+To enable it, run rollout with `maniskill.teleop_input_mode=heuristic`.
 
 ### Implementation Notes
  During teleop, each accepted human step appends: `wrist_cam`, `side_cam`, `tcp_pose`, `joint_pos`, `action`, and `action_mode=INTV` into the same episode trajectory buffer.

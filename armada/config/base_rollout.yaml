@@ -48,6 +48,7 @@ failure_detection:
   num_samples: 1
   num_expert_candidates: 50
   ot_percentile: 95
+  initial_ot_threshold: 1.0
   soft_ot_ratio: 0.2
   update_stats: False
   Ta: ${Ta}

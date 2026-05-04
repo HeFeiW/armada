@@ -58,9 +58,9 @@ class RealEnvRunner(BaseEnvRunner):
             f"human_loop_mode={getattr(human_loop_cfg, 'mode', 'n/a') if human_loop_cfg is not None else 'n/a'}",
         )
 
-        # self.max_episode_length = self._calculate_max_episode_length()
-        # debug: temporarily set max_episode_length to a large value to disable it, since we have manual decisions to end episode in teleop mode
-        self.max_episode_length = 10000
+        self.max_episode_length = self._calculate_max_episode_length()
+        # # debug: temporarily set max_episode_length to a large value to disable it, since we have manual decisions to end episode in teleop mode
+        # self.max_episode_length = 10000
         
         # Initialize failure detection module if specified
         self.failure_detection_module = None
@@ -248,6 +248,7 @@ class RealEnvRunner(BaseEnvRunner):
         steps = np.zeros((self.num_envs,), dtype=np.int32)
         env_finished = np.zeros((self.num_envs,), dtype=np.bool_)
         env_discard = np.zeros((self.num_envs,), dtype=np.bool_)
+        env_success = np.zeros((self.num_envs,), dtype=np.bool_)
         env_teleop = np.zeros((self.num_envs,), dtype=np.bool_)
         env_waiting_decision = np.zeros((self.num_envs,), dtype=np.bool_)
         teleop_steps = np.zeros((self.num_envs,), dtype=np.int32)
@@ -357,14 +358,25 @@ class RealEnvRunner(BaseEnvRunner):
                         )
 
             terminated, truncated = self.robot_env.get_env_done_flags()
+            success_flags = self.robot_env.get_task_success_flags()
             for env_idx in range(self.num_envs):
                 if env_finished[env_idx]:
                     continue
-                if terminated[env_idx]:
+                if success_flags[env_idx]:
+                    env_success[env_idx] = True
                     env_finished[env_idx] = True
                     env_waiting_decision[env_idx] = False
                     if active_decision_env == env_idx:
                         active_decision_env = None
+                    self._ui_update_env(env_idx, int(steps[env_idx]), 'finished', 'success', mode='decision')
+                    continue
+                if terminated[env_idx]:
+                    env_discard[env_idx] = True
+                    env_finished[env_idx] = True
+                    env_waiting_decision[env_idx] = False
+                    if active_decision_env == env_idx:
+                        active_decision_env = None
+                    self._ui_update_env(env_idx, int(steps[env_idx]), 'discarded', 'env_terminated', mode='decision')
                     continue
                 if truncated[env_idx] or steps[env_idx] >= self.max_episode_length:
                     if not env_waiting_decision[env_idx] and not env_teleop[env_idx]:
@@ -423,6 +435,7 @@ class RealEnvRunner(BaseEnvRunner):
                         active_decision_env = None
                         self._ui_update_env(env_idx, int(steps[env_idx]), 'discarded', 'discard', mode='decision')
                     elif decision.action == 'finish':
+                        env_success[env_idx] = True
                         env_finished[env_idx] = True
                         active_decision_env = None
                         self._ui_update_env(env_idx, int(steps[env_idx]), 'finished', 'finish', mode='decision')
@@ -463,6 +476,7 @@ class RealEnvRunner(BaseEnvRunner):
                     steps[env_idx] += 1
                     self._ui_update_env(env_idx, int(steps[env_idx]), 'on decision', 'teleop', mode='teleop')
                 elif self.robot_env.keyboard.quit:
+                    env_discard[:] = True
                     env_finished[:] = True
                     active_decision_env = None
                     break
@@ -486,6 +500,7 @@ class RealEnvRunner(BaseEnvRunner):
                     continue
                 elif self.robot_env.keyboard.finish:
                     self.robot_env.keyboard.finish = False
+                    env_success[env_idx] = True
                     env_finished[env_idx] = True
                     env_teleop[env_idx] = False
                     teleop_steps[env_idx] = 0
@@ -525,6 +540,9 @@ class RealEnvRunner(BaseEnvRunner):
         episode_list = []
         for env_idx in range(self.num_envs):
             if env_discard[env_idx] or len(episode_buffers[env_idx]['action_mode']) == 0:
+                episode_list.append(None)
+                continue
+            if not env_success[env_idx]:
                 episode_list.append(None)
                 continue
 
@@ -665,6 +683,10 @@ class RealEnvRunner(BaseEnvRunner):
                         print(f'Saved episode {self.saved_episode_idx}')
                 else:
                     print("[RUNNER] episode_data is None, no episode appended to replay buffer")
+
+                if self.robot_env.keyboard.quit:
+                    print("[RUNNER] quit flag detected after episode, stopping rollout loop")
+                    break
                 
                 # Reset robot between episodes
                 self.robot_env.reset_robot()
@@ -681,6 +703,7 @@ class RealEnvRunner(BaseEnvRunner):
     def _run_single_episode(self) -> Optional[Dict[str, Any]]:
         """Run a single episode and return episode data"""
         self._ui_set_episode(self.episode_idx)
+        self._episode_success = False
         # Reset keyboard states
         self.robot_env.keyboard.finish = False
         self.robot_env.keyboard.help = False
@@ -762,23 +785,28 @@ class RealEnvRunner(BaseEnvRunner):
             # Human intervention if requested
             if self.robot_env.keyboard.help:
                 intervention_result = self._run_human_intervention(detach_pos, detach_rot)
+                if intervention_result is None:
+                    return None
                 detach_pos, detach_rot = intervention_result['detach_pos'], intervention_result['detach_rot']
 
             if self.robot_env.keyboard.quit:
                 print("[RUNNER] quit flag detected during human intervention, stopping episode")
-                self.robot_env.keyboard.finish = True
-                self._ui_update_env(0, int(self.j), 'finished', 'quit', mode='decision')
-                break
+                self.robot_env.keyboard.finish = False
+                return None
             
             # Check if episode should finish
             if self.robot_env.keyboard.discard:
                 return None
             
             if self.robot_env.keyboard.finish:
+                if not self._episode_success:
+                    self._episode_success = True
                 break
         
         # Finalize episode
         if self.robot_env.keyboard.finish:
+            if not self._episode_success:
+                return None
             episode_data = self._finalize_episode()
             return episode_data
         
@@ -859,6 +887,16 @@ class RealEnvRunner(BaseEnvRunner):
                 
                 time.sleep(max(1 / self.fps - (time.time() - start_time), 0))
                 self.j += 1
+
+                if self.robot_env.is_task_success():
+                    self._episode_success = True
+                    self.robot_env.keyboard.finish = True
+                    self._ui_update_env(0, int(self.j), 'finished', 'success', mode='decision')
+                    print("[RUNNER] ManiSkill success detected, finishing episode")
+                    break
+
+            if self.robot_env.keyboard.finish:
+                break
             
             # ================Detect failure===============
             if self.failure_detection_module:
@@ -1005,6 +1043,13 @@ class RealEnvRunner(BaseEnvRunner):
             print(f"[RUNNER] teleop step accepted, new j={self.j}")
             self._ui_update_env(0, int(self.j), 'on decision', 'teleop', mode='teleop')
 
+            if self.robot_env.is_task_success():
+                self._episode_success = True
+                self.robot_env.keyboard.finish = True
+                self._ui_update_env(0, int(self.j), 'finished', 'success', mode='decision')
+                print("[RUNNER] ManiSkill success detected during teleop, finishing episode")
+                break
+
             if self.sim_dashboard is not None:
                 self.sim_dashboard.show(
                     {0: {'side_img': teleop_data['demo_side_img'].permute(1, 2, 0).cpu().numpy().astype(np.uint8), 'wrist_img': teleop_data['demo_wrist_img'].permute(1, 2, 0).cpu().numpy().astype(np.uint8)}},
@@ -1016,6 +1061,10 @@ class RealEnvRunner(BaseEnvRunner):
                     }},
                     banner=f"Episode {self.episode_idx} | human intervention",
                 )
+
+        if self.robot_env.keyboard.quit:
+            self._episode_success = False
+            return None
         
         # Reset target pose tracking after human intervention
         self.episode_manager.initialize_pose(last_p, last_r.as_quat(scalar_first=True))
@@ -1062,12 +1111,25 @@ class RealEnvRunner(BaseEnvRunner):
         curr_timestep = self.j
         prev_side_cam = None
         prev_wrist_cam = None
+        fd_max_timestep = int(getattr(self.failure_detection_module, 'max_episode_length', 0) or 0)
+        skipped_fd_overflow = False
         print(f"[RUNNER] rewind_with_failure_detection start j={self.j}")
         
         for _ in range(curr_timestep):
-            if not self.failure_detection_module.rewind_step(self.j, self.episode_buffers, curr_timestep):
-                print(f"[RUNNER] rewind stopped by failure detector at j={self.j}")
-                break
+            # FLOAT OT plan is bounded by its max_episode_length. If teleop ran
+            # longer than that horizon, rewind raw steps first until indices are valid.
+            should_query_fd = (fd_max_timestep <= 0) or (self.j <= fd_max_timestep)
+            if should_query_fd:
+                if not self.failure_detection_module.rewind_step(self.j, self.episode_buffers, curr_timestep):
+                    print(f"[RUNNER] rewind stopped by failure detector at j={self.j}")
+                    break
+            elif not skipped_fd_overflow:
+                print(
+                    f"[RUNNER] rewind j={self.j} exceeds FLOAT horizon={fd_max_timestep}; "
+                    "rewinding without OT-plan update until back in range"
+                )
+                skipped_fd_overflow = True
+
             # Rewind one step on robot
             curr_pos, curr_rot, prev_side_cam, prev_wrist_cam = self._rewind_single_step(curr_pos, curr_rot)
             self.j -= 1

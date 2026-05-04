@@ -32,11 +32,20 @@ class HeuristicPickPolicy:
         self.max_rot_delta = float(self.config.get('max_rot_delta', 0.6))
         self.approach_tolerance = float(self.config.get('approach_tolerance', 0.015))
         self.grasp_height_offset = float(self.config.get('grasp_height_offset', 0.00))
+        self.lock_lift_rotation = bool(self.config.get('lock_lift_rotation', False))
+        self.use_cube_pose_for_lift_rotation = bool(self.config.get('use_cube_pose_for_lift_rotation', False))
         self.fixed_goal_pos = self.config.get('fixed_goal_pos', None)
         if self.fixed_goal_pos is not None:
             self.fixed_goal_pos = np.asarray(self.fixed_goal_pos, dtype=np.float32).reshape(-1)
             if self.fixed_goal_pos.shape[0] != 3:
                 raise ValueError(f"fixed_goal_pos must have shape (3,), got {self.fixed_goal_pos.shape}")
+        self.fixed_goal_quat_wxyz = self.config.get('fixed_goal_quat_wxyz', None)
+        if self.fixed_goal_quat_wxyz is not None:
+            self.fixed_goal_quat_wxyz = np.asarray(self.fixed_goal_quat_wxyz, dtype=np.float32).reshape(-1)
+            if self.fixed_goal_quat_wxyz.shape[0] != 4:
+                raise ValueError(
+                    f"fixed_goal_quat_wxyz must have shape (4,), got {self.fixed_goal_quat_wxyz.shape}"
+                )
 
         # State tracking
         self.prev_tcp_pose = None
@@ -44,6 +53,8 @@ class HeuristicPickPolicy:
         self.grasp_issued = False
         self.debug = bool(self.config.get('debug', False))
         self._grasp_ref_rp = None
+        self._lift_rot_ref = None
+        self._cube_to_tcp_rot_at_grasp = None
 
     def get_action(self, obs: Dict, obj_pose: Optional[np.ndarray] = None) -> np.ndarray:
         """
@@ -56,7 +67,7 @@ class HeuristicPickPolicy:
             action: (8,) array [dx, dy, dz, dqx, dqy, dqz, dqw, gripper]
         """
         # Get target pose
-        target_tcp_pos, target_tcp_rot, target_gripper = self._get_target(obs, obj_pose=obj_pose)
+        target_tcp_pos, target_tcp_rot, target_gripper = self.get_target_pose(obs, obj_pose=obj_pose)
 
         # Compute action
         action_delta = self._compute_delta_action(obs, target_tcp_pos, target_tcp_rot)
@@ -69,6 +80,10 @@ class HeuristicPickPolicy:
                 f"Target Gripper: {target_gripper}, action: {action}"
             )
         return action.astype(np.float32)
+
+    def get_target_pose(self, obs: Dict, obj_pose: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Return the current heuristic TCP target pose and gripper command."""
+        return self._get_target(obs, obj_pose=obj_pose)
 
     def to_maniskill_action(self, action: np.ndarray) -> np.ndarray:
         """Convert ARMADA 8D action to ManiSkill 7D pd_ee_delta_pose action.
@@ -151,6 +166,10 @@ class HeuristicPickPolicy:
             target_rot = grasp_rot
             target_gripper = 0.0
             if np.linalg.norm(tcp_pos - grasp_pose) <= self.approach_tolerance:
+                if np.linalg.norm(cube_quat) > 1e-8 and np.linalg.norm(tcp_quat) > 1e-8:
+                    cube_rot_now = R.from_quat(cube_quat / np.linalg.norm(cube_quat), scalar_first=True)
+                    tcp_rot_now = R.from_quat(tcp_quat / np.linalg.norm(tcp_quat), scalar_first=True)
+                    self._cube_to_tcp_rot_at_grasp = cube_rot_now.inv() * tcp_rot_now
                 self.phase = 'grasp'
         elif self.phase == 'grasp':
             # One-step grasp command.
@@ -158,10 +177,29 @@ class HeuristicPickPolicy:
             target_rot = grasp_rot
             target_gripper = 1.0
             self.grasp_issued = True
+            if self._cube_to_tcp_rot_at_grasp is None and np.linalg.norm(cube_quat) > 1e-8 and np.linalg.norm(tcp_quat) > 1e-8:
+                cube_rot_now = R.from_quat(cube_quat / np.linalg.norm(cube_quat), scalar_first=True)
+                tcp_rot_now = R.from_quat(tcp_quat / np.linalg.norm(tcp_quat), scalar_first=True)
+                self._cube_to_tcp_rot_at_grasp = cube_rot_now.inv() * tcp_rot_now
             self.phase = 'lift'
         else:  # self.phase == 'lift'
             target_pos = lift_target
-            target_rot = grasp_rot
+            if (
+                self.use_cube_pose_for_lift_rotation
+                and self.fixed_goal_quat_wxyz is not None
+                and self._cube_to_tcp_rot_at_grasp is not None
+            ):
+                goal_cube_rot = R.from_quat(
+                    self.fixed_goal_quat_wxyz / np.linalg.norm(self.fixed_goal_quat_wxyz),
+                    scalar_first=True,
+                )
+                target_rot = (goal_cube_rot * self._cube_to_tcp_rot_at_grasp).as_matrix().astype(np.float32)
+            elif self.lock_lift_rotation:
+                if self._lift_rot_ref is None:
+                    self._lift_rot_ref = grasp_rot.copy()
+                target_rot = self._lift_rot_ref
+            else:
+                target_rot = grasp_rot
             target_gripper = 1.0
 
         if self.debug:
@@ -281,3 +319,5 @@ class HeuristicPickPolicy:
         self.grasp_issued = False
         self.prev_tcp_pose = None
         self._grasp_ref_rp = None
+        self._lift_rot_ref = None
+        self._cube_to_tcp_rot_at_grasp = None

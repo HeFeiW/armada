@@ -158,3 +158,5 @@ Common fallback messages:
 - The offline renderer reads saved data only. It does not require ManiSkill to be running.
 - If your saved episode contains only partial data, the renderer will skip missing fields.
 - If the rollout output is not what you expect, first inspect the rendered video before changing training or policy code.
+
+

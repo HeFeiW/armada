@@ -140,7 +140,7 @@ def collect_episode(
 
 def main():
     parser = argparse.ArgumentParser(description='Collect data for ManiSkill PickCube task')
-    parser.add_argument('--output', type=str, default=str(REPO_ROOT / 'armada_data' / 'maniskill_pick'),
+    parser.add_argument('--output', type=str, default=str(REPO_ROOT / 'armada_data' / 'maniskill_pick_fixed_goal_min'),
                         help='Output directory for zarr data')
     # data collection parameters
     parser.add_argument('--num-envs', type=int, default=1, help='Number of parallel environments')

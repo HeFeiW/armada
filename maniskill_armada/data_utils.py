@@ -194,7 +194,7 @@ def extract_action_from_poses(current_pose: np.ndarray, target_pose: np.ndarray,
     tgt_rot = R.from_quat(target_pose[3:7])
 
     # Relative rotation
-    rel_rot = tgt_rot * curr_rot.inv()
+    rel_rot = curr_rot.inv() * tgt_rot
     rot_delta_quat = rel_rot.as_quat()  # [qx, qy, qz, qw]
 
     # Gripper delta

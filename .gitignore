@@ -4,7 +4,8 @@ visual/
 visual
 tmp/
 debug/
-
+*.png
+*.pth
 
 data
 tmp_*

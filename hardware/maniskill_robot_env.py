@@ -2,6 +2,7 @@ import time
 import os
 import select
 import sys
+from itertools import permutations, product
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -14,6 +15,7 @@ from PIL import Image
 from scipy.spatial.transform import Rotation as R
 from torchvision.transforms import CenterCrop, Compose, InterpolationMode, Resize
 from maniskill_armada.data_utils import extract_action_from_poses
+from maniskill_armada.heuristic_teleop_node import HeuristicTeleopNode
 
 from hardware.my_device.macros import INTV
 
@@ -66,8 +68,22 @@ class ManiSkillRobotEnv:
         self.teleop_feedback_from_measured_pose = bool(cfg.get("teleop_feedback_from_measured_pose", True))
         self.teleop_show_help = bool(cfg.get("teleop_show_help", True))
         self.teleop_use_cv2_keys = bool(cfg.get("teleop_use_cv2_keys", True))
+        self.teleop_input_mode = str(cfg.get("teleop_input_mode", "keyboard")).lower()
+        self.teleop_heuristic_cfg = cfg.get("teleop_heuristic", {}) or {}
         self.teleop_terminal_poll_timeout_s = float(cfg.get("teleop_terminal_poll_timeout_s", 0.2))
         self.teleop_no_input_log_interval_s = float(cfg.get("teleop_no_input_log_interval_s", 2.0))
+        self.success_use_env_info = bool(cfg.get("success_use_env_info", True))
+        self.success_use_pose_check = bool(cfg.get("success_use_pose_check", True))
+        self.success_require_static = bool(cfg.get("success_require_static", False))
+        self.success_pos_tolerance = float(cfg.get("success_pos_tolerance", 0.03))
+        self.success_rot_tolerance_deg = float(cfg.get("success_rot_tolerance_deg", 20.0))
+        self.success_target_pose_wxyz = np.asarray(
+            cfg.get(
+                "success_target_pose_wxyz",
+                [0.02510096, -0.00136661, 0.2814997, 0.7723232, 0.61468965, 0.15892147, 0.02043187],
+            ),
+            dtype=np.float32,
+        ).reshape(7)
         self.debug_camera_enable = bool(cfg.get("debug_camera_enable", False))
         self.debug_side_camera_offset = np.asarray(
             cfg.get("debug_side_camera_offset", [0.0, 0.0, 0.0]), dtype=np.float32
@@ -138,6 +154,27 @@ class ManiSkillRobotEnv:
         self._stdin_hint_printed = False
         self._stdin_unavailable_warned = False
         self._last_no_input_log_time = 0.0
+        self._cube_symmetry_rotations = self._build_cube_symmetry_rotations()
+        self._heuristic_teleop_node = None
+
+    def _build_cube_symmetry_rotations(self):
+        symmetries = []
+        basis = np.eye(3, dtype=np.float32)
+        for perm in permutations(range(3)):
+            permuted = basis[:, perm]
+            for signs in product((-1.0, 1.0), repeat=3):
+                mat = permuted * np.asarray(signs, dtype=np.float32)
+                if np.isclose(np.linalg.det(mat), 1.0, atol=1e-5):
+                    symmetries.append(R.from_matrix(mat))
+
+        unique = []
+        seen = set()
+        for rot in symmetries:
+            key = tuple(np.round(rot.as_quat(scalar_first=True), 6))
+            if key not in seen:
+                seen.add(key)
+                unique.append(rot)
+        return unique
 
     def _try_apply_sensor_pose_offset(self, sensor_obj: Any, offset: np.ndarray) -> bool:
         if sensor_obj is None:
@@ -287,6 +324,91 @@ class ManiSkillRobotEnv:
             np.float32
         )
 
+    def _extract_cube_pose(self, env_idx: Optional[int] = None) -> Optional[np.ndarray]:
+        if env_idx is None:
+            env_idx = self.active_env_idx
+
+        cube = getattr(self.env.unwrapped, "cube", None)
+        if cube is None or not hasattr(cube, "pose"):
+            return None
+
+        cube_pose = getattr(cube.pose, "raw_pose", None)
+        if cube_pose is None:
+            return None
+
+        cube_pose = self._to_numpy(cube_pose)
+        if cube_pose.ndim == 1:
+            return cube_pose.astype(np.float32)
+        return cube_pose[env_idx].astype(np.float32)
+
+    def _get_env_success_flag(self, env_idx: Optional[int] = None) -> bool:
+        if env_idx is None:
+            env_idx = self.active_env_idx
+
+        if self.success_use_env_info and isinstance(self.last_info, dict) and "success" in self.last_info:
+            success_info = self._to_numpy(self.last_info["success"])
+            if success_info.ndim == 0:
+                return bool(success_info)
+            return bool(success_info[env_idx])
+
+        return False
+
+    def _pose_matches_with_cube_symmetry(self, current_pose: np.ndarray, target_pose: np.ndarray) -> bool:
+        current_pose = np.asarray(current_pose, dtype=np.float32).reshape(7)
+        target_pose = np.asarray(target_pose, dtype=np.float32).reshape(7)
+
+        pos_error = np.linalg.norm(current_pose[:3] - target_pose[:3])
+        if pos_error > self.success_pos_tolerance:
+            return False
+
+        current_rot = R.from_quat(self._quat_wxyz_to_xyzw(current_pose[3:7]))
+        target_rot = R.from_quat(self._quat_wxyz_to_xyzw(target_pose[3:7]))
+        tolerance_rad = np.deg2rad(self.success_rot_tolerance_deg)
+
+        if not self._cube_symmetry_rotations:
+            rel = current_rot.inv() * target_rot
+            return np.linalg.norm(rel.as_rotvec()) <= tolerance_rad
+
+        for symmetry in self._cube_symmetry_rotations:
+            sym_target = target_rot * symmetry
+            rel = current_rot.inv() * sym_target
+            if np.linalg.norm(rel.as_rotvec()) <= tolerance_rad:
+                return True
+
+        return False
+
+    def is_task_success(self, env_idx: Optional[int] = None) -> bool:
+        if env_idx is None:
+            env_idx = self.active_env_idx
+
+        if self._get_env_success_flag(env_idx):
+            return True
+
+        if not self.success_use_pose_check:
+            return False
+
+        cube_pose = self._extract_cube_pose(env_idx)
+        if cube_pose is None:
+            return False
+
+        if self.success_require_static:
+            info = self.last_info if isinstance(self.last_info, dict) else {}
+            if "is_robot_static" in info:
+                robot_static = self._to_numpy(info["is_robot_static"])
+                if robot_static.ndim == 0:
+                    if not bool(robot_static):
+                        return False
+                elif not bool(robot_static[env_idx]):
+                    return False
+
+        return self._pose_matches_with_cube_symmetry(cube_pose, self.success_target_pose_wxyz)
+
+    def get_task_success_flags(self) -> np.ndarray:
+        flags = np.zeros((self.num_envs,), dtype=np.bool_)
+        for env_idx in range(self.num_envs):
+            flags[env_idx] = self.is_task_success(env_idx)
+        return flags
+
     def _render_image(self, camera_name: str, env_idx: Optional[int] = None) -> np.ndarray:
         if env_idx is None:
             env_idx = self.active_env_idx
@@ -332,6 +454,8 @@ class ManiSkillRobotEnv:
         self._stdin_hint_printed = False
         self._stdin_unavailable_warned = False
         self._last_no_input_log_time = 0.0
+        if self._heuristic_teleop_node is not None:
+            self._heuristic_teleop_node.reset()
 
         self._snapshots = []
         self._capture_snapshot()
@@ -541,65 +665,91 @@ class ManiSkillRobotEnv:
         )
         self._teleop_help_printed = True
 
-    def human_teleop_step(self, last_p, last_r):
+    def _get_heuristic_teleop_node(self):
+        if self._heuristic_teleop_node is None:
+            heuristic_cfg = dict(self.teleop_heuristic_cfg)
+            heuristic_cfg.setdefault("gripper_max_width", self.gripper_max_width)
+            heuristic_cfg.setdefault("success_target_pose_wxyz", self.success_target_pose_wxyz)
+            self._heuristic_teleop_node = HeuristicTeleopNode(self.env, config=heuristic_cfg)
+        return self._heuristic_teleop_node
+
+    def human_teleop_step(self, last_p, last_r, target_tcp_pose=None, target_gripper_width=None):
         start_time = time.time()
         self._teleop_steps += 1
         self._print_teleop_help_once()
 
-        key = self._poll_keyboard_key()
         prev_p = np.asarray(last_p, dtype=np.float32).copy()
         prev_q_wxyz = last_r.as_quat(scalar_first=True).astype(np.float32)
         dp = np.zeros(3, dtype=np.float32)
         d_rotvec = np.zeros(3, dtype=np.float32)
         gripper_action = float(self.last_gripper_width)
-        if key == "q":
-            self.keyboard.quit = True
-        elif key == "f":
-            self.keyboard.finish = True
-        elif key == "d":
-            self.keyboard.discard = True
-        elif key == "c":
-            self.keyboard.infer = True
-        elif key == "w":
-            dp[0] += self.teleop_pos_step
-        elif key == "s":
-            dp[0] -= self.teleop_pos_step
-        elif key == "a":
-            dp[1] += self.teleop_pos_step
-        elif key == "z":
-            dp[1] -= self.teleop_pos_step
-        elif key == "r":
-            dp[2] += self.teleop_pos_step
-        elif key == "v":
-            dp[2] -= self.teleop_pos_step
-        elif key == "u":
-            d_rotvec[0] += np.deg2rad(self.teleop_rot_step_deg)
-        elif key == "j":
-            d_rotvec[0] -= np.deg2rad(self.teleop_rot_step_deg)
-        elif key == "i":
-            d_rotvec[1] += np.deg2rad(self.teleop_rot_step_deg)
-        elif key == "k":
-            d_rotvec[1] -= np.deg2rad(self.teleop_rot_step_deg)
-        elif key == "o":
-            d_rotvec[2] += np.deg2rad(self.teleop_rot_step_deg)
-        elif key == "l":
-            d_rotvec[2] -= np.deg2rad(self.teleop_rot_step_deg)
-        elif key == "n":
-            gripper_action = float(np.clip(self.last_gripper_width - self.teleop_gripper_step, 0.0, self.gripper_max_width))
-        elif key == "m":
-            gripper_action = float(np.clip(self.last_gripper_width + self.teleop_gripper_step, 0.0, self.gripper_max_width))
 
-        target_p = np.asarray(last_p, dtype=np.float32) + dp
-        delta_r = R.from_rotvec(d_rotvec.astype(np.float64))
-        if self.teleop_rotation_world_frame:
-            # Apply increments in world axes so keys map to world-frame orientation updates.
-            target_r = delta_r * last_r
+        if target_tcp_pose is None and self.teleop_input_mode == "heuristic":
+            heuristic_command = self._get_heuristic_teleop_node().next_command(last_p, last_r)
+            target_tcp_pose = heuristic_command.target_tcp_pose
+            target_gripper_width = heuristic_command.target_gripper_width
+            if heuristic_command.should_exit:
+                if heuristic_command.exit_reason == "success":
+                    self.keyboard.finish = True
+                else:
+                    self.keyboard.infer = True
+
+        if target_tcp_pose is not None:
+            target_pose = np.asarray(target_tcp_pose, dtype=np.float32).reshape(7)
+            target_p = target_pose[:3]
+            target_r = R.from_quat(target_pose[3:], scalar_first=True)
+            if target_gripper_width is not None:
+                gripper_action = float(np.clip(target_gripper_width, 0.0, self.gripper_max_width))
         else:
-            # Optional fallback to TCP-local increment behavior.
-            target_r = last_r * delta_r
+            key = self._poll_keyboard_key()
+            if key == "q":
+                self.keyboard.quit = True
+            elif key == "f":
+                self.keyboard.finish = True
+            elif key == "d":
+                self.keyboard.discard = True
+            elif key == "c":
+                self.keyboard.infer = True
+            elif key == "w":
+                dp[0] += self.teleop_pos_step
+            elif key == "s":
+                dp[0] -= self.teleop_pos_step
+            elif key == "a":
+                dp[1] += self.teleop_pos_step
+            elif key == "z":
+                dp[1] -= self.teleop_pos_step
+            elif key == "r":
+                dp[2] += self.teleop_pos_step
+            elif key == "v":
+                dp[2] -= self.teleop_pos_step
+            elif key == "u":
+                d_rotvec[0] += np.deg2rad(self.teleop_rot_step_deg)
+            elif key == "j":
+                d_rotvec[0] -= np.deg2rad(self.teleop_rot_step_deg)
+            elif key == "i":
+                d_rotvec[1] += np.deg2rad(self.teleop_rot_step_deg)
+            elif key == "k":
+                d_rotvec[1] -= np.deg2rad(self.teleop_rot_step_deg)
+            elif key == "o":
+                d_rotvec[2] += np.deg2rad(self.teleop_rot_step_deg)
+            elif key == "l":
+                d_rotvec[2] -= np.deg2rad(self.teleop_rot_step_deg)
+            elif key == "n":
+                gripper_action = float(np.clip(self.last_gripper_width - self.teleop_gripper_step, 0.0, self.gripper_max_width))
+            elif key == "m":
+                gripper_action = float(np.clip(self.last_gripper_width + self.teleop_gripper_step, 0.0, self.gripper_max_width))
+
+            target_p = np.asarray(last_p, dtype=np.float32) + dp
+            delta_r = R.from_rotvec(d_rotvec.astype(np.float64))
+            if self.teleop_rotation_world_frame:
+                # Apply increments in world axes so keys map to world-frame orientation updates.
+                target_r = delta_r * last_r
+            else:
+                # Optional fallback to TCP-local increment behavior.
+                target_r = last_r * delta_r
 
         control_signal_set = self.keyboard.infer or self.keyboard.finish or self.keyboard.discard or self.keyboard.quit
-        has_motion = (np.linalg.norm(dp) > 0) or (np.linalg.norm(d_rotvec) > 0)
+        has_motion = target_tcp_pose is not None or (np.linalg.norm(dp) > 0) or (np.linalg.norm(d_rotvec) > 0)
         has_gripper_update = abs(gripper_action - float(self.last_gripper_width)) > 1e-8
         curr_p_action = np.zeros(3, dtype=np.float32)
         curr_r_action = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)

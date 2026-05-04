@@ -27,6 +27,7 @@ class FLOAT(AsyncFailureDetectionModule):
                  num_samples: int = 4,
                  num_expert_candidates: int = 50,
                  ot_percentile: float = 95,
+                 initial_ot_threshold: Optional[float] = 1.0,
                  soft_ot_ratio: float = 0.2,
                  update_stats: bool = False,
                  Ta: int = 8,
@@ -54,6 +55,9 @@ class FLOAT(AsyncFailureDetectionModule):
         self.num_samples: int = num_samples
         self.num_expert_candidates: int = num_expert_candidates
         self.ot_percentile: float = ot_percentile
+        self.initial_ot_threshold: Optional[float] = (
+            float(initial_ot_threshold) if initial_ot_threshold is not None else None
+        )
         self.soft_ot_ratio: float = soft_ot_ratio
         self.update_stats: bool = update_stats
         self.debug_ot_per_step: bool = debug_ot_per_step
@@ -89,7 +93,7 @@ class FLOAT(AsyncFailureDetectionModule):
         self._current_robot_state: Optional[Dict[str, Any]] = None
 
         # Thresholds and success statistics
-        self.expert_ot_threshold: Optional[float] = None
+        self.expert_ot_threshold: Optional[float] = self.initial_ot_threshold
         self.success_ot_values: np.ndarray = np.zeros((0,))
         self.human_latent_cache_version: int = 1
 
@@ -581,6 +585,8 @@ class FLOAT(AsyncFailureDetectionModule):
         self.ot_percentile = success_stats.get('ot_percentile', self.ot_percentile)
         if len(self.success_ot_values) > 0:
             self.expert_ot_threshold = np.percentile(self.success_ot_values, self.ot_percentile)
+        else:
+            print("No success OT values found in loaded statistics, keeping existing threshold and percentile.")
 
     def get_success_statistics(self) -> Dict[str, Any]:
         return {
@@ -683,7 +689,7 @@ class FLOAT(AsyncFailureDetectionModule):
             print("Loading success statistics from the previous round.")
             try:
                 import os
-                prev_success_states = np.load(os.path.join(self.train_dataset_path, 'success_stats.npz'))
+                prev_success_states = np.load(os.path.join(self.save_buffer_path, 'success_stats.npz'))
                 self.load_success_statistics(prev_success_states)
             except FileNotFoundError:
                 print("No previous success statistics found, initializing fresh.") 

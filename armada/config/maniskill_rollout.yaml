@@ -11,8 +11,9 @@ device_ids: '0'
 
 # Model / data paths
 
-checkpoint_path: /home/tmp_wanghf/armada/outputs/2026.04.04/21.22.42_train_diffusion_transformer_hybrid_dino_multi_gpu_maniskill_pick/checkpoints/latest.ckpt
-train_dataset_path: /home/tmp_wanghf/armada/armada_data/maniskill_pick
+# checkpoint_path: /home/tmp_wanghf/armada/outputs/2026.04.04/21.22.42_train_diffusion_transformer_hybrid_dino_multi_gpu_maniskill_pick/checkpoints/latest.ckpt
+checkpoint_path: /home/tmp_wanghf/armada/outputs/2026.04.16/21.27.49_train_diffusion_transformer_hybrid_dino_multi_gpu_maniskill_pick/checkpoints/latest.ckpt # this is the checkpoint after training with the new dataset maniskill_pick_fixed_goal_min for about 5 epochs.
+train_dataset_path: /home/tmp_wanghf/armada/armada_data/maniskill_pick_fixed_goal_min # TODO: it was maniskill_pick, but we changed to maniskill_pick_fixed_goal_min which set goal pose to a fixed pose to make it easier for failure detection learning.
 save_buffer_path: /home/tmp_wanghf/armada/armada_data/maniskill_pick_rollout_poc
 output_dir: /home/tmp_wanghf/armada/outputs_rollout/maniskill_poc
 
@@ -43,6 +44,18 @@ maniskill:
   teleop_show_help: true
   teleop_terminal_poll_timeout_s: 0.2
   teleop_no_input_log_interval_s: 2.0
+  teleop_input_mode: heuristic #keyboard
+  teleop_heuristic:
+    debug: true
+    max_steps: 256
+    exit_on_success: true
+    use_cube_pose_for_lift_rotation: false
+  success_use_env_info: true
+  success_use_pose_check: true
+  success_require_static: false
+  success_pos_tolerance: 0.03
+  success_rot_tolerance_deg: 20.0
+  success_target_pose_wxyz: [0.02510096, -0.00136661, 0.2814997, 0.7723232, 0.61468965, 0.15892147, 0.02043187]
   # Keep disabled by default; set true for temporary teleop camera debugging.
   debug_camera_enable: true
   # Original camera setup is unchanged when offsets are [0, 0, 0].
@@ -71,6 +84,7 @@ failure_detection:
   num_samples: 1
   num_expert_candidates: 50
   ot_percentile: 95
+  initial_ot_threshold: 0.3
   soft_ot_ratio: 0.2
   update_stats: False
   debug_ot_per_step: true
