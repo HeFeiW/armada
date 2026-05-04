@@ -2,6 +2,7 @@ import time
 import os
 import select
 import sys
+import re
 from itertools import permutations, product
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -58,6 +59,14 @@ class ManiSkillRobotEnv:
         self.seed = int(cfg.get("seed", 0))
         self.side_camera_name = cfg.get("side_camera_name", "base_camera")
         self.wrist_camera_name = cfg.get("wrist_camera_name", "base_camera")
+        self.auto_select_cameras = bool(cfg.get("auto_select_cameras", True))
+        self.wrist_camera_follow_tcp = bool(cfg.get("wrist_camera_follow_tcp", False))
+        self.wrist_camera_tcp_pos_offset = np.asarray(
+            cfg.get("wrist_camera_tcp_pos_offset", [0.0, 0.0, 0.0]), dtype=np.float32
+        ).reshape(3)
+        self.wrist_camera_tcp_quat_wxyz_offset = np.asarray(
+            cfg.get("wrist_camera_tcp_quat_wxyz_offset", [1.0, 0.0, 0.0, 0.0]), dtype=np.float32
+        ).reshape(4)
         self.max_snapshot_steps = int(cfg.get("max_snapshot_steps", 5000))
         self.auto_intervention_steps = int(cfg.get("auto_intervention_steps", 8))
         self.gripper_max_width = float(cfg.get("gripper_max_width", 0.09))
@@ -156,6 +165,8 @@ class ManiSkillRobotEnv:
         self._last_no_input_log_time = 0.0
         self._cube_symmetry_rotations = self._build_cube_symmetry_rotations()
         self._heuristic_teleop_node = None
+        self._camera_names_auto_selected = False
+        self._available_camera_names_last = []
 
     def _build_cube_symmetry_rotations(self):
         symmetries = []
@@ -237,6 +248,209 @@ class ManiSkillRobotEnv:
             )
         else:
             print("[SIM TELEOP] Debug camera offsets could not be applied on current ManiSkill sensor objects.")
+
+    def _get_sensor_dict(self) -> Optional[Dict[str, Any]]:
+        sensors = getattr(self.env.unwrapped, "_sensors", None)
+        if not isinstance(sensors, dict):
+            sensors = getattr(self.env.unwrapped, "sensors", None)
+        if isinstance(sensors, dict):
+            return sensors
+        return None
+
+    def _list_available_camera_names_from_obs(self, obs: Any) -> list:
+        if not isinstance(obs, dict):
+            return []
+        sensor_data = obs.get("sensor_data", {})
+        if not isinstance(sensor_data, dict):
+            return []
+        names = []
+        for name, payload in sensor_data.items():
+            if isinstance(payload, dict) and ("rgb" in payload):
+                names.append(str(name))
+        return names
+
+    def _pick_camera_by_keywords(self, names: list, keywords: list, exclude: Optional[str] = None) -> Optional[str]:
+        if not names:
+            return None
+        exclude = str(exclude) if exclude is not None else None
+        pattern = re.compile("|".join([re.escape(k) for k in keywords]), flags=re.IGNORECASE)
+
+        scored = []
+        for name in names:
+            if exclude is not None and name == exclude:
+                continue
+            m = pattern.search(name)
+            if m:
+                scored.append((m.start(), len(name), name))
+        if scored:
+            scored.sort()
+            return scored[0][2]
+
+        for name in names:
+            if exclude is not None and name == exclude:
+                continue
+            return name
+        return None
+
+    def _auto_select_camera_names_once(self):
+        if self._camera_names_auto_selected or (not self.auto_select_cameras):
+            return
+
+        available = self._list_available_camera_names_from_obs(self.last_obs)
+        self._available_camera_names_last = available
+        if not available:
+            # Can't auto-detect without sensor_data; keep user-provided names.
+            self._camera_names_auto_selected = True
+            return
+
+        # If both names resolve to the same camera, try to pick a better wrist camera.
+        side_name = str(self.side_camera_name)
+        wrist_name = str(self.wrist_camera_name)
+
+        if side_name not in available:
+            side_candidate = self._pick_camera_by_keywords(
+                available,
+                keywords=["base", "side", "front", "external", "main", "viewer"],
+                exclude=None,
+            )
+            if side_candidate is not None:
+                side_name = side_candidate
+
+        if (wrist_name not in available) or (wrist_name == side_name):
+            wrist_candidate = self._pick_camera_by_keywords(
+                available,
+                keywords=["wrist", "hand", "ee", "tcp", "gripper", "end", "effector"],
+                exclude=side_name,
+            )
+            if wrist_candidate is not None:
+                wrist_name = wrist_candidate
+
+        # Persist selection.
+        self.side_camera_name = side_name
+        self.wrist_camera_name = wrist_name
+        self._camera_names_auto_selected = True
+
+        if self.side_camera_name == self.wrist_camera_name:
+            print(
+                "[SIM TELEOP][WARN] side_camera_name and wrist_camera_name resolve to the same sensor "
+                f"('{self.side_camera_name}'). Available cameras: {available}. "
+                "If you expect an end-effector camera, ensure the ManiSkill env defines a second camera sensor "
+                "(often named like 'hand_camera' / 'wrist_camera') and set wrist_camera_name accordingly."
+            )
+        else:
+            print(
+                "[SIM TELEOP] Camera selection: "
+                f"side='{self.side_camera_name}', wrist='{self.wrist_camera_name}'. "
+                f"Available cameras: {available}"
+            )
+
+    def _set_sensor_pose(self, sensor_obj: Any, pos: np.ndarray, quat_wxyz: np.ndarray) -> bool:
+        if sensor_obj is None:
+            return False
+        pose_owner = sensor_obj
+        pose = getattr(sensor_obj, "pose", None)
+        if pose is None and hasattr(sensor_obj, "camera"):
+            pose_owner = getattr(sensor_obj, "camera")
+            pose = getattr(pose_owner, "pose", None)
+        if pose is None:
+            return False
+
+        pos = np.asarray(pos, dtype=np.float32)
+        quat_wxyz = np.asarray(quat_wxyz, dtype=np.float32)
+
+        try:
+            pose_cls = type(pose)
+            if hasattr(pose_cls, "create_from_pq"):
+                new_pose = pose_cls.create_from_pq(pos, quat_wxyz)
+            else:
+                new_pose = pose_cls(pos, quat_wxyz)
+        except Exception:
+            return False
+
+        try:
+            if hasattr(pose_owner, "set_pose"):
+                pose_owner.set_pose(new_pose)
+                return True
+            if hasattr(pose_owner, "pose"):
+                pose_owner.pose = new_pose
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _maybe_update_wrist_camera_pose_from_tcp(self):
+        if not self.wrist_camera_follow_tcp:
+            return
+        sensors = self._get_sensor_dict()
+        if not isinstance(sensors, dict):
+            return
+        wrist_sensor = sensors.get(self.wrist_camera_name)
+        if wrist_sensor is None:
+            return
+
+        # Avoid mutating the same sensor used for side view.
+        if str(self.wrist_camera_name) == str(self.side_camera_name):
+            return
+
+        # Prefer batch TCP pose from obs for vectorized envs.
+        tcp_pose = None
+        if isinstance(self.last_obs, dict):
+            extra = self.last_obs.get("extra", {})
+            tcp_pose = extra.get("tcp_pose", None)
+
+        # Fallback: read directly from the agent TCP pose.
+        if tcp_pose is None:
+            try:
+                tcp = getattr(getattr(self.env.unwrapped.agent, "tcp", None), "pose", None)
+                if tcp is not None:
+                    p = self._to_numpy(getattr(tcp, "p"))
+                    q = self._to_numpy(getattr(tcp, "q"))
+                    tcp_pose = np.concatenate([p, q], axis=-1)
+            except Exception:
+                tcp_pose = None
+
+        if tcp_pose is None:
+            return
+
+        tcp_pose = self._to_numpy(tcp_pose).astype(np.float32)
+        if tcp_pose.ndim == 1:
+            tcp_pose = tcp_pose.reshape(1, 7)
+
+        # Compute camera world pose = tcp_pose * offset.
+        tcp_pos = tcp_pose[:, :3]
+        tcp_quat_wxyz = tcp_pose[:, 3:7]
+        tcp_rot = R.from_quat(tcp_quat_wxyz.astype(np.float64), scalar_first=True)
+        offset_pos = self.wrist_camera_tcp_pos_offset.astype(np.float64)
+        offset_rot = R.from_quat(self.wrist_camera_tcp_quat_wxyz_offset.astype(np.float64), scalar_first=True)
+
+        cam_pos = tcp_pos.astype(np.float64) + tcp_rot.apply(offset_pos.reshape(1, 3))
+        cam_rot = (tcp_rot * offset_rot)
+        cam_quat_wxyz = cam_rot.as_quat(scalar_first=True).astype(np.float32)
+
+        # Apply pose (best-effort). Many ManiSkill sensor poses are not batched;
+        # in that case, just use the active env pose.
+        pose = getattr(wrist_sensor, "pose", None)
+        if pose is None and hasattr(wrist_sensor, "camera"):
+            pose = getattr(getattr(wrist_sensor, "camera"), "pose", None)
+
+        try:
+            pose_p = np.asarray(getattr(pose, "p"), dtype=np.float32) if pose is not None else None
+        except Exception:
+            pose_p = None
+
+        if pose_p is not None and pose_p.ndim == 2 and pose_p.shape[0] == cam_pos.shape[0]:
+            ok = self._set_sensor_pose(wrist_sensor, cam_pos.astype(np.float32), cam_quat_wxyz)
+        else:
+            idx = int(np.clip(self.active_env_idx, 0, cam_pos.shape[0] - 1))
+            ok = self._set_sensor_pose(
+                wrist_sensor,
+                cam_pos[idx].astype(np.float32),
+                cam_quat_wxyz[idx].astype(np.float32),
+            )
+
+        if not ok:
+            # Silent failure to avoid log spam; user can disable follow-tcp.
+            return
 
     def _to_numpy(self, value):
         if isinstance(value, torch.Tensor):
@@ -443,6 +657,7 @@ class ManiSkillRobotEnv:
         self.keyboard.discard = False
 
         self.last_obs, self.last_info = self.env.reset(seed=self.seed)
+        self._auto_select_camera_names_once()
         tcp_pose = self._extract_tcp_pose(self.last_obs, self.active_env_idx)
         self.last_tcp_pose = tcp_pose
         self.robot.init_pose = tcp_pose.copy()
@@ -460,6 +675,7 @@ class ManiSkillRobotEnv:
         self._snapshots = []
         self._capture_snapshot()
         self._apply_debug_camera_offsets_once()
+        self._maybe_update_wrist_camera_pose_from_tcp()
 
         # random_init_pose is accepted for API compatibility but not enforced in simulator.
         _ = random_init
@@ -559,6 +775,8 @@ class ManiSkillRobotEnv:
         self.last_done = bool(self.last_terminated[env_idx] or self.last_truncated[env_idx])
         self.last_gripper_width = float(gripper_action)
         self._capture_snapshot()
+        self._auto_select_camera_names_once()
+        self._maybe_update_wrist_camera_pose_from_tcp()
 
     def deploy_action_batch(self, tcp_actions: Dict[int, np.ndarray], gripper_actions: Dict[int, float]):
         action_dim = self.env.action_space.shape[-1]
@@ -581,6 +799,8 @@ class ManiSkillRobotEnv:
         self.last_truncated = self._to_numpy(truncated).astype(np.bool_)
         self.last_done = bool(np.any(self.last_terminated | self.last_truncated))
         self._capture_snapshot()
+        self._auto_select_camera_names_once()
+        self._maybe_update_wrist_camera_pose_from_tcp()
 
     def save_scene_images(self, output_dir, episode_idx):
         state = self.get_robot_state()
