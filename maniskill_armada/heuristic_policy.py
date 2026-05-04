@@ -34,6 +34,9 @@ class HeuristicPickPolicy:
         self.grasp_height_offset = float(self.config.get('grasp_height_offset', 0.00))
         self.lock_lift_rotation = bool(self.config.get('lock_lift_rotation', False))
         self.use_cube_pose_for_lift_rotation = bool(self.config.get('use_cube_pose_for_lift_rotation', False))
+        # When True, lift phase only enforces target position; rotation delta is kept ~0
+        # by setting target_rot to current TCP rotation.
+        self.lift_position_only = True # bool(self.config.get('lift_position_only', True))
         self.fixed_goal_pos = self.config.get('fixed_goal_pos', None)
         if self.fixed_goal_pos is not None:
             self.fixed_goal_pos = np.asarray(self.fixed_goal_pos, dtype=np.float32).reshape(-1)
@@ -184,22 +187,26 @@ class HeuristicPickPolicy:
             self.phase = 'lift'
         else:  # self.phase == 'lift'
             target_pos = lift_target
-            if (
-                self.use_cube_pose_for_lift_rotation
-                and self.fixed_goal_quat_wxyz is not None
-                and self._cube_to_tcp_rot_at_grasp is not None
-            ):
-                goal_cube_rot = R.from_quat(
-                    self.fixed_goal_quat_wxyz / np.linalg.norm(self.fixed_goal_quat_wxyz),
-                    scalar_first=True,
-                )
-                target_rot = (goal_cube_rot * self._cube_to_tcp_rot_at_grasp).as_matrix().astype(np.float32)
-            elif self.lock_lift_rotation:
-                if self._lift_rot_ref is None:
-                    self._lift_rot_ref = grasp_rot.copy()
-                target_rot = self._lift_rot_ref
+            if self.lift_position_only and (np.linalg.norm(tcp_quat) > 1e-8):
+                tcp_rot_now = R.from_quat(tcp_quat / np.linalg.norm(tcp_quat), scalar_first=True)
+                target_rot = tcp_rot_now.as_matrix().astype(np.float32)
             else:
-                target_rot = grasp_rot
+                if (
+                    self.use_cube_pose_for_lift_rotation
+                    and self.fixed_goal_quat_wxyz is not None
+                    and self._cube_to_tcp_rot_at_grasp is not None
+                ):
+                    goal_cube_rot = R.from_quat(
+                        self.fixed_goal_quat_wxyz / np.linalg.norm(self.fixed_goal_quat_wxyz),
+                        scalar_first=True,
+                    )
+                    target_rot = (goal_cube_rot * self._cube_to_tcp_rot_at_grasp).as_matrix().astype(np.float32)
+                elif self.lock_lift_rotation:
+                    if self._lift_rot_ref is None:
+                        self._lift_rot_ref = grasp_rot.copy()
+                    target_rot = self._lift_rot_ref
+                else:
+                    target_rot = grasp_rot
             target_gripper = 1.0
 
         if self.debug:

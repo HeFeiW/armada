@@ -149,6 +149,101 @@ def set_env_goal_pos(env: Any, goal_pos_xyz: np.ndarray) -> bool:
     return updated
 
 
+def _get_sensor_dict(env: Any) -> Optional[Dict[str, Any]]:
+    unwrapped = getattr(env, 'unwrapped', env)
+    sensors = getattr(unwrapped, '_sensors', None)
+    if not isinstance(sensors, dict):
+        sensors = getattr(unwrapped, 'sensors', None)
+    if isinstance(sensors, dict):
+        return sensors
+    return None
+
+
+def attach_camera_to_tcp(
+    env: Any,
+    camera_name: str,
+    tcp_pose_wxyz: np.ndarray,
+    pos_offset_xyz: Optional[np.ndarray] = None,
+    quat_wxyz_offset: Optional[np.ndarray] = None,
+) -> bool:
+    """Best-effort attach a named ManiSkill sensor camera to TCP pose.
+
+    This mutates the sensor pose so that sensor_data[camera_name] renders from a TCP-following view.
+    If the env doesn't expose a mutable sensor pose, returns False.
+    """
+    if env is None or camera_name is None:
+        return False
+
+    sensors = _get_sensor_dict(env)
+    if not isinstance(sensors, dict):
+        return False
+    sensor = sensors.get(camera_name)
+    if sensor is None:
+        return False
+
+    tcp_pose_wxyz = np.asarray(tcp_pose_wxyz, dtype=np.float32).reshape(-1)
+    if tcp_pose_wxyz.shape[0] != 7:
+        return False
+
+    pos_offset_xyz = np.zeros(3, dtype=np.float32) if pos_offset_xyz is None else np.asarray(pos_offset_xyz, dtype=np.float32).reshape(3)
+    quat_wxyz_offset = (
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        if quat_wxyz_offset is None
+        else np.asarray(quat_wxyz_offset, dtype=np.float32).reshape(4)
+    )
+
+    tcp_pos = tcp_pose_wxyz[:3].astype(np.float64)
+    tcp_quat = tcp_pose_wxyz[3:7].astype(np.float64)
+    if np.linalg.norm(tcp_quat) < 1e-8:
+        tcp_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    tcp_rot = R.from_quat(tcp_quat / np.linalg.norm(tcp_quat), scalar_first=True)
+    off_rot = R.from_quat(quat_wxyz_offset.astype(np.float64) / max(np.linalg.norm(quat_wxyz_offset), 1e-8), scalar_first=True)
+
+    cam_pos = tcp_pos + tcp_rot.apply(pos_offset_xyz.astype(np.float64))
+    cam_rot = tcp_rot * off_rot
+    cam_quat_wxyz = cam_rot.as_quat(scalar_first=True).astype(np.float32)
+
+    # Sensor object may wrap a camera.
+    pose_owner = sensor
+    pose = getattr(sensor, 'pose', None)
+    if pose is None and hasattr(sensor, 'camera'):
+        pose_owner = getattr(sensor, 'camera')
+        pose = getattr(pose_owner, 'pose', None)
+    if pose is None:
+        return False
+
+    # Prefer sapien.Pose if available.
+    new_pose = None
+    try:
+        from sapien import Pose  # type: ignore
+
+        new_pose = Pose(p=cam_pos.astype(float).tolist(), q=cam_quat_wxyz.astype(float).tolist())
+    except Exception:
+        new_pose = None
+
+    if new_pose is None:
+        # Try class constructor or create_from_pq.
+        try:
+            pose_cls = type(pose)
+            if hasattr(pose_cls, 'create_from_pq'):
+                new_pose = pose_cls.create_from_pq(cam_pos.astype(np.float32), cam_quat_wxyz)
+            else:
+                new_pose = pose_cls(cam_pos.astype(np.float32), cam_quat_wxyz)
+        except Exception:
+            return False
+
+    try:
+        if hasattr(pose_owner, 'set_pose'):
+            pose_owner.set_pose(new_pose)
+            return True
+        if hasattr(pose_owner, 'pose'):
+            pose_owner.pose = new_pose
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def maniskill_obs_to_armada_format(obs: Dict, env: Any) -> Dict:
     """
     Convert ManiSkill observation dict to ARMADA format.
@@ -191,8 +286,15 @@ def maniskill_obs_to_armada_format(obs: Dict, env: Any) -> Dict:
     }
 
 
-def render_cameras(obs_or_env: Any, env: Any = None, camera_names: Optional[list] = None,
-                   resolution: Tuple[int, int] = (640, 480)) -> Tuple[np.ndarray, np.ndarray]:
+def render_cameras(
+    obs_or_env: Any,
+    env: Any = None,
+    camera_names: Optional[list] = None,
+    resolution: Tuple[int, int] = (640, 480),
+    wrist_follow_tcp: bool = False,
+    wrist_tcp_pos_offset: Optional[np.ndarray] = None,
+    wrist_tcp_quat_wxyz_offset: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Render RGB images from multiple camera viewpoints.
 
@@ -208,14 +310,18 @@ def render_cameras(obs_or_env: Any, env: Any = None, camera_names: Optional[list
     if camera_names is None:
         obs_tmp = obs_or_env if isinstance(obs_or_env, dict) else None
         side, wrist, _names = auto_select_camera_names(obs_tmp, default_side='base_camera', default_wrist='base_camera')
-        camera_names = [side, wrist]
+        # If only one camera exists, use it as wrist and fallback to env.render() for side.
+        if len(_names) == 1:
+            camera_names = [None, _names[0]]
+        else:
+            camera_names = [side, wrist]
         # One-time debug print to help verify camera wiring.
         if not hasattr(render_cameras, '_printed_camera_selection'):
             setattr(render_cameras, '_printed_camera_selection', True)
             if _names:
-                print(f"[collect_data] Available cameras: {_names}; selected side='{side}', wrist='{wrist}'")
+                print(f"[collect_data] Available cameras: {_names}; selected side='{camera_names[0]}', wrist='{camera_names[1]}'")
             else:
-                print(f"[collect_data] No sensor_data cameras found; fallback side='{side}', wrist='{wrist}'")
+                print(f"[collect_data] No sensor_data cameras found; fallback side='{camera_names[0]}', wrist='{camera_names[1]}'")
 
     obs = obs_or_env if isinstance(obs_or_env, dict) else None
     if env is None and obs is None:
@@ -228,14 +334,80 @@ def render_cameras(obs_or_env: Any, env: Any = None, camera_names: Optional[list
 
         if obs is not None:
             sensor_data = obs.get('sensor_data', {})
-            if camera_names[1] in sensor_data and 'rgb' in sensor_data[camera_names[1]]:
-                wrist_tensor = sensor_data[camera_names[1]]['rgb']
+            if not isinstance(sensor_data, dict):
+                sensor_data = {}
+            # Update wrist sensor pose from TCP before reading image (best-effort).
+            if wrist_follow_tcp and (env is not None) and (camera_names is not None) and (len(camera_names) >= 2):
+                wrist_name = camera_names[1]
+                try:
+                    extra = obs.get('extra', {})
+                    tcp_pose = extra.get('tcp_pose', None)
+                    if tcp_pose is not None and wrist_name is not None:
+                        tcp_pose = _to_numpy(tcp_pose)
+                        if tcp_pose.ndim == 2:
+                            tcp_pose = tcp_pose[0]
+                        ok = attach_camera_to_tcp(
+                            env,
+                            str(wrist_name),
+                            tcp_pose,
+                            pos_offset_xyz=wrist_tcp_pos_offset,
+                            quat_wxyz_offset=wrist_tcp_quat_wxyz_offset,
+                        )
+
+                        # If pose update succeeded, refresh sensor output; obs.sensor_data was captured earlier.
+                        if ok:
+                            unwrapped = getattr(env, 'unwrapped', env)
+                            refreshed = None
+                            # 1) Some ManiSkill envs expose get_sensor_images()
+                            try:
+                                if hasattr(unwrapped, 'get_sensor_images'):
+                                    refreshed = unwrapped.get_sensor_images()
+                            except Exception:
+                                refreshed = None
+                            # 2) Or render_sensors()
+                            if refreshed is None:
+                                try:
+                                    if hasattr(unwrapped, 'render_sensors'):
+                                        refreshed = unwrapped.render_sensors()
+                                except Exception:
+                                    refreshed = None
+                            # 3) Or capture_sensor_data() + get_obs()
+                            if refreshed is None:
+                                try:
+                                    if hasattr(unwrapped, 'capture_sensor_data') and hasattr(unwrapped, 'get_obs'):
+                                        unwrapped.capture_sensor_data()
+                                        obs2 = unwrapped.get_obs()
+                                        refreshed = obs2.get('sensor_data', None) if isinstance(obs2, dict) else None
+                                except Exception:
+                                    refreshed = None
+
+                            if isinstance(refreshed, dict):
+                                # Normalize to sensor_data-like structure if possible.
+                                # Some APIs return {name: rgb_array}; wrap it to {name: {'rgb': rgb_array}}.
+                                if len(refreshed) > 0:
+                                    first_val = next(iter(refreshed.values()))
+                                    if not isinstance(first_val, dict):
+                                        refreshed = {k: {'rgb': v} for k, v in refreshed.items()}
+                                sensor_data = refreshed
+
+                            # One-time debug to confirm follow-tcp path engaged.
+                            if not hasattr(render_cameras, '_printed_wrist_follow_tcp'):
+                                setattr(render_cameras, '_printed_wrist_follow_tcp', True)
+                                print(f"[collect_data] wrist_follow_tcp enabled; attach ok={ok}; refreshed_sensor_data={isinstance(sensor_data, dict) and (len(sensor_data)>0)}")
+                except Exception:
+                    pass
+
+            wrist_name = camera_names[1] if (camera_names is not None and len(camera_names) >= 2) else None
+            side_name = camera_names[0] if (camera_names is not None and len(camera_names) >= 1) else None
+
+            if wrist_name is not None and wrist_name in sensor_data and 'rgb' in sensor_data[wrist_name]:
+                wrist_tensor = sensor_data[wrist_name]['rgb']
                 if hasattr(wrist_tensor, 'detach'):
                     wrist_img = wrist_tensor.detach().cpu().numpy()[0]
                 else:
                     wrist_img = np.asarray(wrist_tensor)[0]
-            if camera_names[0] in sensor_data and 'rgb' in sensor_data[camera_names[0]]:
-                side_tensor = sensor_data[camera_names[0]]['rgb']
+            if side_name is not None and side_name in sensor_data and 'rgb' in sensor_data[side_name]:
+                side_tensor = sensor_data[side_name]['rgb']
                 if hasattr(side_tensor, 'detach'):
                     side_img = side_tensor.detach().cpu().numpy()[0]
                 else:

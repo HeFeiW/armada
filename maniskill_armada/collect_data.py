@@ -9,7 +9,7 @@ import sys
 import argparse
 import numpy as np
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 import time
 import gymnasium as gym
 import mani_skill.envs  
@@ -26,6 +26,126 @@ from maniskill_armada.data_utils import (
     resize_images,
     normalize_image
 )
+
+
+def _pick_mount_link(links_map: Dict[str, Any]):
+    # Prefer existing camera mount links if present.
+    preferred = [
+        'camera_link',
+        'hand_camera_link',
+        'wrist_camera_link',
+        'panda_hand',
+        'hand',
+        'wrist',
+        'link7',
+        'ee_link',
+    ]
+    for name in preferred:
+        if name in links_map:
+            return links_map[name]
+    # Fallback: try fuzzy match.
+    for key in links_map.keys():
+        lk = key.lower()
+        if 'camera' in lk:
+            return links_map[key]
+    for key in links_map.keys():
+        lk = key.lower()
+        if 'hand' in lk or 'wrist' in lk or 'ee' in lk:
+            return links_map[key]
+    # Final fallback: last link object.
+    try:
+        return list(links_map.values())[-1]
+    except Exception:
+        return None
+
+
+def ensure_wrist_camera_sensor(env, uid: str = 'wrist_camera', width: int = 640, height: int = 480) -> bool:
+    """Best-effort add a wrist-mounted camera to the ManiSkill env.
+
+    Returns True if a reconfigure was attempted and the camera appears in obs.sensor_data.
+    """
+    try:
+        from mani_skill.sensors.camera import CameraConfig  # type: ignore
+        import sapien  # type: ignore
+    except Exception:
+        return False
+
+    unwrapped = getattr(env, 'unwrapped', env)
+
+    # If it already exists, nothing to do.
+    try:
+        obs0 = unwrapped.get_obs() if hasattr(unwrapped, 'get_obs') else None
+        if isinstance(obs0, dict) and isinstance(obs0.get('sensor_data', None), dict):
+            if uid in obs0['sensor_data']:
+                return True
+            # also accept common names
+            for alt in ['hand_camera', 'wrist_cam', 'hand_cam']:
+                if alt in obs0['sensor_data']:
+                    return True
+    except Exception:
+        pass
+
+    # Build mount link.
+    try:
+        robot = unwrapped.agent.robot
+        links_map = getattr(robot, 'links_map', None)
+        if not isinstance(links_map, dict):
+            return False
+        mount_link = _pick_mount_link(links_map)
+        if mount_link is None:
+            return False
+    except Exception:
+        return False
+
+    # Create a camera config mounted to EE.
+    try:
+        cam_cfg = CameraConfig(
+            uid=uid,
+            pose=sapien.Pose(p=[0.0, 0.0, 0.0], q=[1.0, 0.0, 0.0, 0.0]),
+            width=int(width),
+            height=int(height),
+            fov=float(np.pi / 2),
+            near=0.01,
+            far=100.0,
+            mount=mount_link,
+        )
+    except Exception:
+        return False
+
+    # Install as custom sensor config and reconfigure.
+    try:
+        existing = getattr(unwrapped, '_custom_sensor_configs', None)
+        if existing is None:
+            existing = []
+        # Ensure it's a list we can append.
+        existing_list = list(existing)
+        # Avoid duplicates.
+        existing_uids = set()
+        for cfg in existing_list:
+            u = getattr(cfg, 'uid', None)
+            if u is not None:
+                existing_uids.add(str(u))
+        if uid not in existing_uids:
+            existing_list.append(cam_cfg)
+        setattr(unwrapped, '_custom_sensor_configs', existing_list)
+
+        if hasattr(unwrapped, '_reconfigure'):
+            try:
+                unwrapped._reconfigure()
+            except TypeError:
+                # Some versions expect a bool or kwargs; fall back to calling without args already tried.
+                pass
+
+        # Trigger a fresh observation to confirm.
+        try:
+            obs1 = unwrapped.get_obs() if hasattr(unwrapped, 'get_obs') else None
+            if isinstance(obs1, dict) and isinstance(obs1.get('sensor_data', None), dict):
+                return uid in obs1['sensor_data']
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
 
 
 def get_env_obj_pose(env) -> np.ndarray:
@@ -72,6 +192,7 @@ def collect_episode(
             obs = env.unwrapped.get_obs()
         except Exception:
             pass
+
     policy.reset()
 
     done = False
@@ -98,7 +219,12 @@ def collect_episode(
     while not done and step < max_steps:
         # Render cameras from ManiSkill obs + env
         try:
-            side_img, wrist_img = render_cameras(obs, env, resolution=(640, 480))
+            # Only enable follow-tcp hack when there is still only one sensor camera.
+            sensor_names = []
+            if isinstance(obs, dict) and isinstance(obs.get('sensor_data', None), dict):
+                sensor_names = list(obs['sensor_data'].keys())
+            wrist_follow = len(sensor_names) <= 1
+            side_img, wrist_img = render_cameras(obs, env, resolution=(640, 480), wrist_follow_tcp=wrist_follow)
         except Exception as e:
             print(f"  Warning: Camera rendering failed at step {step}: {e}")
             side_img = np.ones((480, 640, 3), dtype=np.uint8) * 128
@@ -249,16 +375,31 @@ def main():
 
     print(f"Environment created successfully")
 
+    # One-time: try to inject a true wrist camera mounted to end-effector.
+    # Do a warmup reset so robot links exist; then install config + reconfigure.
+    try:
+        _obs0, _info0 = env.reset(seed=args.seed)
+    except Exception:
+        _obs0, _info0 = None, None
+
+    wrist_ok = ensure_wrist_camera_sensor(env, uid='wrist_camera', width=640, height=480)
+    setattr(env, '_armada_wrist_sensor_installed', bool(wrist_ok))
+    if wrist_ok:
+        print("[collect_data] Installed EE-mounted wrist_camera sensor via CameraConfig")
+    else:
+        print("[collect_data][WARN] Could not install EE-mounted wrist camera; will fall back to single-camera mode")
+
     # Initialize heuristic policy
     policy_cfg = {}
     fixed_env_goal_pos = None
     if args.fixed_goal_pos is not None:
         policy_cfg['fixed_goal_pos'] = list(args.fixed_goal_pos)
+        # For fixed-goal dataset collection, keep lift as position-only.
+        policy_cfg['lift_position_only'] = True
         print(f"Using fixed heuristic goal_pos: {policy_cfg['fixed_goal_pos']}")
         print(
-            "Note: --fixed-goal-pos overrides the heuristic lift target only; "
-            "ManiSkill obs extra['goal_pos'] may still vary across resets. "
-            "This script saves both lift_goal_pos (used by policy) and env_goal_pos (from obs) per step."
+            "Note: This script will also try to override ManiSkill env goal_pos after each reset to match --fixed-goal-pos. "
+            "It saves both lift_goal_pos (used by policy) and env_goal_pos (from obs) per step for verification."
         )
         # Also request env-level fixed goal by default to keep task goal consistent.
         fixed_env_goal_pos = np.asarray(args.fixed_goal_pos, dtype=np.float32).reshape(3)
