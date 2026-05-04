@@ -22,6 +22,7 @@ from maniskill_armada.heuristic_policy import HeuristicPickPolicy
 from maniskill_armada.data_utils import (
     maniskill_obs_to_armada_format,
     render_cameras,
+    set_env_goal_pos,
     resize_images,
     normalize_image
 )
@@ -43,6 +44,7 @@ def collect_episode(
     episode_idx: int,
     max_steps: int = 200,
     reset_seed: Optional[int] = None,
+    fixed_env_goal_pos: Optional[np.ndarray] = None,
 ) -> Dict:
     """
     Collect one episode using heuristic policy.
@@ -57,6 +59,19 @@ def collect_episode(
         dict with episode data {wrist_cam, side_cam, tcp_pose, joint_pos, action}
     """
     obs, info = env.reset(seed=reset_seed)
+    # Keep cube spawn random, but optionally override the environment's internal goal.
+    if fixed_env_goal_pos is not None:
+        ok = set_env_goal_pos(env, fixed_env_goal_pos)
+        if not ok:
+            print(
+                f"  Warning: Failed to override env goal_pos to {np.asarray(fixed_env_goal_pos).reshape(-1)[:3].tolist()}. "
+                "Policy lift goal may still be fixed, but env obs/reward goal may vary."
+            )
+        # Refresh obs so obs['extra']['goal_pos'] reflects the overridden goal.
+        try:
+            obs = env.unwrapped.get_obs()
+        except Exception:
+            pass
     policy.reset()
 
     done = False
@@ -68,7 +83,13 @@ def collect_episode(
         'side_cam': [],
         'tcp_pose': [],
         'joint_pos': [],
-        'action': []
+        'action': [],
+        # Always store the lift goal used for this episode.
+        # If --fixed-goal-pos is provided, this will be constant across episodes.
+        'lift_goal_pos': [],
+        # ManiSkill env may also expose an internal goal_pos in obs['extra'].
+        # This can vary across resets even when the heuristic uses a fixed lift goal.
+        'env_goal_pos': [],
     }
 
     # Store previous pose for action computation
@@ -93,6 +114,26 @@ def collect_episode(
             tcp_pose = np.zeros(7, dtype=np.float32)
             joint_pos = np.zeros(7, dtype=np.float32)
 
+        # Resolve lift goal used by heuristic policy (preferred), plus env goal for reference.
+        env_goal_pos = None
+        try:
+            extra = obs.get('extra', {}) if isinstance(obs, dict) else {}
+            env_goal_pos = extra.get('goal_pos', None)
+            if env_goal_pos is not None:
+                env_goal_pos = np.asarray(env_goal_pos, dtype=np.float32)
+                if env_goal_pos.ndim == 2:
+                    env_goal_pos = env_goal_pos[0]
+                env_goal_pos = env_goal_pos.reshape(-1)[:3]
+        except Exception:
+            env_goal_pos = None
+
+        lift_goal_pos = getattr(policy, 'fixed_goal_pos', None)
+        if lift_goal_pos is not None:
+            lift_goal_pos = np.asarray(lift_goal_pos, dtype=np.float32).reshape(-1)[:3]
+        else:
+            # Fallback to env-reported goal_pos if present; otherwise keep zeros.
+            lift_goal_pos = env_goal_pos if env_goal_pos is not None else np.zeros(3, dtype=np.float32)
+
         # Get action from policy
         try:
             obj_pose = get_env_obj_pose(env)
@@ -107,6 +148,8 @@ def collect_episode(
         episode_data['tcp_pose'].append(tcp_pose)
         episode_data['joint_pos'].append(joint_pos)
         episode_data['action'].append(action)
+        episode_data['lift_goal_pos'].append(lift_goal_pos)
+        episode_data['env_goal_pos'].append(env_goal_pos if env_goal_pos is not None else np.zeros(3, dtype=np.float32))
 
         # Execute action in environment
         try:
@@ -208,9 +251,17 @@ def main():
 
     # Initialize heuristic policy
     policy_cfg = {}
+    fixed_env_goal_pos = None
     if args.fixed_goal_pos is not None:
         policy_cfg['fixed_goal_pos'] = list(args.fixed_goal_pos)
         print(f"Using fixed heuristic goal_pos: {policy_cfg['fixed_goal_pos']}")
+        print(
+            "Note: --fixed-goal-pos overrides the heuristic lift target only; "
+            "ManiSkill obs extra['goal_pos'] may still vary across resets. "
+            "This script saves both lift_goal_pos (used by policy) and env_goal_pos (from obs) per step."
+        )
+        # Also request env-level fixed goal by default to keep task goal consistent.
+        fixed_env_goal_pos = np.asarray(args.fixed_goal_pos, dtype=np.float32).reshape(3)
 
     policy = HeuristicPickPolicy(env, config=policy_cfg)
 
@@ -225,7 +276,14 @@ def main():
         print(f"\nEpisode {ep_idx + 1}/{args.num_episodes}...")
         try:
             reset_seed = args.fixed_reset_seed
-            result = collect_episode(env, policy, ep_idx, max_steps=args.max_steps, reset_seed=reset_seed)
+            result = collect_episode(
+                env,
+                policy,
+                ep_idx,
+                max_steps=args.max_steps,
+                reset_seed=reset_seed,
+                fixed_env_goal_pos=fixed_env_goal_pos,
+            )
 
             if result is None:
                 print("FAILED (no data)")

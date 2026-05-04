@@ -13,6 +13,142 @@ from typing import Dict, Tuple, Optional, Any
 import cv2
 
 
+def _to_numpy(x: Any) -> np.ndarray:
+    if hasattr(x, 'detach'):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _list_camera_names_from_obs(obs: Optional[Dict]) -> list:
+    if not isinstance(obs, dict):
+        return []
+    sensor_data = obs.get('sensor_data', {})
+    if not isinstance(sensor_data, dict):
+        return []
+    names = []
+    for name, payload in sensor_data.items():
+        if isinstance(payload, dict) and ('rgb' in payload):
+            names.append(str(name))
+    return names
+
+
+def _pick_camera_name(names: list, keywords: list, exclude: Optional[str] = None) -> Optional[str]:
+    if not names:
+        return None
+    exclude = str(exclude) if exclude is not None else None
+    lowered = [(n, n.lower()) for n in names]
+
+    # keyword match first
+    for kw in keywords:
+        kw = kw.lower()
+        for n, ln in lowered:
+            if exclude is not None and n == exclude:
+                continue
+            if kw in ln:
+                return n
+
+    # fallback: any other
+    for n, _ln in lowered:
+        if exclude is not None and n == exclude:
+            continue
+        return n
+    return None
+
+
+def auto_select_camera_names(obs: Optional[Dict], default_side: str = 'base_camera', default_wrist: str = 'base_camera') -> Tuple[str, str, list]:
+    """Choose distinct side/wrist camera names based on sensor_data keys."""
+    names = _list_camera_names_from_obs(obs)
+    if not names:
+        return default_side, default_wrist, []
+
+    side = default_side if default_side in names else _pick_camera_name(
+        names,
+        keywords=['base', 'side', 'front', 'external', 'main', 'viewer'],
+        exclude=None,
+    )
+    if side is None:
+        side = names[0]
+
+    wrist = default_wrist if default_wrist in names else None
+    if wrist is None or wrist == side:
+        wrist = _pick_camera_name(
+            names,
+            keywords=['wrist', 'hand', 'ee', 'tcp', 'gripper', 'end', 'effector'],
+            exclude=side,
+        )
+    if wrist is None:
+        wrist = side
+    return side, wrist, names
+
+
+def set_env_goal_pos(env: Any, goal_pos_xyz: np.ndarray) -> bool:
+    """Best-effort: force ManiSkill env goal position while leaving object spawn random.
+
+    Tries to update `env.unwrapped.goal_site` pose and common attributes like `goal_pos` / `_goal_pos`.
+    Returns True if any update succeeded.
+    """
+    if goal_pos_xyz is None:
+        return False
+    goal_pos_xyz = np.asarray(goal_pos_xyz, dtype=np.float32).reshape(3)
+
+    unwrapped = getattr(env, 'unwrapped', env)
+    updated = False
+
+    # 1) Update goal_site pose if present.
+    goal_site = getattr(unwrapped, 'goal_site', None)
+    if goal_site is not None:
+        # Try sapien.Pose (common in ManiSkill)
+        pose_obj = None
+        try:
+            from sapien import Pose  # type: ignore
+
+            pose_obj = Pose(p=goal_pos_xyz.astype(float).tolist(), q=[1.0, 0.0, 0.0, 0.0])
+        except Exception:
+            pose_obj = None
+
+        if pose_obj is not None:
+            try:
+                if hasattr(goal_site, 'set_pose'):
+                    goal_site.set_pose(pose_obj)
+                    updated = True
+                elif hasattr(goal_site, 'pose'):
+                    goal_site.pose = pose_obj
+                    updated = True
+            except Exception:
+                pass
+
+    # 2) Update common stored goal position attributes if present.
+    for attr in ['goal_pos', '_goal_pos']:
+        if hasattr(unwrapped, attr):
+            try:
+                current = getattr(unwrapped, attr)
+            except Exception:
+                current = None
+
+            try:
+                # Preserve torch tensor type/device if used internally.
+                if current is not None and current.__class__.__name__ == 'Tensor':
+                    try:
+                        import torch  # type: ignore
+
+                        new_val = torch.as_tensor(goal_pos_xyz, dtype=current.dtype, device=current.device)
+                        if hasattr(current, 'ndim') and getattr(current, 'ndim', 1) == 2:
+                            new_val = new_val.reshape(1, 3)
+                        setattr(unwrapped, attr, new_val)
+                        updated = True
+                        continue
+                    except Exception:
+                        pass
+
+                # Default numpy path.
+                setattr(unwrapped, attr, goal_pos_xyz.copy())
+                updated = True
+            except Exception:
+                pass
+
+    return updated
+
+
 def maniskill_obs_to_armada_format(obs: Dict, env: Any) -> Dict:
     """
     Convert ManiSkill observation dict to ARMADA format.
@@ -68,8 +204,18 @@ def render_cameras(obs_or_env: Any, env: Any = None, camera_names: Optional[list
     Returns:
         (side_img, wrist_img): Both (height, width, 3) uint8 RGB
     """
+    # If camera_names is not provided, prefer choosing distinct cameras from sensor_data.
     if camera_names is None:
-        camera_names = ['base_camera', 'base_camera']
+        obs_tmp = obs_or_env if isinstance(obs_or_env, dict) else None
+        side, wrist, _names = auto_select_camera_names(obs_tmp, default_side='base_camera', default_wrist='base_camera')
+        camera_names = [side, wrist]
+        # One-time debug print to help verify camera wiring.
+        if not hasattr(render_cameras, '_printed_camera_selection'):
+            setattr(render_cameras, '_printed_camera_selection', True)
+            if _names:
+                print(f"[collect_data] Available cameras: {_names}; selected side='{side}', wrist='{wrist}'")
+            else:
+                print(f"[collect_data] No sensor_data cameras found; fallback side='{side}', wrist='{wrist}'")
 
     obs = obs_or_env if isinstance(obs_or_env, dict) else None
     if env is None and obs is None:
